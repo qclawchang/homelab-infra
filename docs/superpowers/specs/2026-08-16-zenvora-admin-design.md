@@ -136,24 +136,28 @@ single `proxy_pass` location block, no restart-sensitive volume change.
    for secret scanning in the original design and is the same false-signal class the
    design already handled for branch protection.
 4. **Deployment drift** — modeled **per running container**, not per repo (6 repos map
-   to 7 containers today; two repos have none, one has two). Reads container state via
+   to 7 containers today; two repos have none, one has two; the 7th container, nginx,
+   isn't a deployed product image and isn't tracked here). Reads container state via
    the docker-socket-proxy and reports two *distinct* signals, not one conflated
-   "drift" flag. Comparison is by **tag, not content digest** — this repo's
-   SHA-pinned services (`family-api`, `securevault-api`, `memorial-api`,
-   `memorial-worker`) pin via a tag env var whose value *is* a commit SHA, not a
-   separate manifest digest, and `dayandyou-staging`/`dayandyou-prod` have **no**
-   per-deploy pin mechanism in `docker-compose.yml` at all (static `:staging`/
-   `:release` tags) — for those two, only the upgrade-available signal is possible,
-   never the fault signal, since there's nothing pinned to have drifted from.
-   - **Fault signal**: the container's actually-running image tag doesn't match the
-     tag pinned for it in `docker-compose.yml` (only possible where a pin exists) —
-     this means a deploy didn't apply or a container restarted onto a stale image.
-     This is the one that should look alarming.
+   "drift" flag. This is a **staleness** comparison, not a pin comparison — there is
+   no durable "what should be running" value anywhere on this host to check against.
+   An earlier version of this design tried comparing the running image's tag against
+   a value mirroring `docker-compose.yml`'s own per-service tag variables
+   (`FAMILY_API_TAG` etc.), on the assumption those were stable pins; tracing the
+   actual deploy process (each product's own CI workflow SSHing in and running
+   `export FAMILY_API_TAG=<sha>; docker compose up -d <service>` as a one-off) showed
+   that value never persists anywhere `zenvora-admin`'s own, separately-running
+   container could read it. Comparing to GHCR build recency instead needs no such
+   external state:
    - **Upgrade-available signal**: GHCR has a newer image version than the one
      currently running (found by listing package versions ordered by creation — GHCR
      has no literal "latest tag" endpoint, so "latest" is inferred as most-recently-
-     created). This is informational, not a fault, and must be visually distinct from
-     the fault signal above.
+     created), and that newer version is recent (within a staleness threshold,
+     default 48h). Informational — a deploy just hasn't happened yet, normal.
+   - **Fault signal**: same as above, but the newer version has existed *past* the
+     staleness threshold and still isn't running — likely a stuck or forgotten
+     deploy, not just "hasn't happened yet." This is the one that should look
+     alarming, and must be visually distinct from the upgrade-available signal above.
 5. **Backlog** — open PRs awaiting the user's review, open issues assigned to the
    user, stale branches (default: no commits in 90 days), aggregated across all 6
    repos into one list.

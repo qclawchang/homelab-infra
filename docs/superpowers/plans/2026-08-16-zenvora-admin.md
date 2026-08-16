@@ -19,7 +19,7 @@
 - Login requires both: (1) the authenticated GitHub user's **immutable numeric ID** matches a single whitelisted ID, and (2) that GitHub account's `two_factor_authentication` field is `true`. Both fail closed.
 - Sessions live in SQLite; the cookie holds only an opaque session ID (httpOnly, secure, `SameSite=Strict`), never the GitHub token itself. Revocation is a row delete.
 - Docker state is read only via the `docker-socket-proxy` sidecar's `GET /containers/*` — the backend never mounts `/var/run/docker.sock` directly.
-- Deployment drift compares **tags**, not content digests (the repo's SHA-pinned services use the SHA as the tag itself), and reports two distinct signals per container, never conflated: `fault` (running tag ≠ pinned tag — only possible when a pin exists) and `upgrade_available` (GHCR has something newer than what's running). Two of the six containers (`dayandyou-staging`/`-prod`) have no pin mechanism at all and can only ever report `ok`/`upgrade_available`, never `fault`.
+- Deployment drift is a **staleness** signal, not a pin comparison — there's no durable "what should be running" value anywhere on this host to compare against (see Task 13), so it's computed from how long a newer GHCR build has existed relative to what's currently running: `ok` (already caught up), `upgrade_available` (newer build exists, but recent — informational), `fault` (newer build has existed past a threshold, default 48h — worth alarming about).
 - Branch protection and secret scanning both render `unavailable_on_plan`, not a false negative — GitHub Free cannot enable either on private repos.
 - GitHub API responses are cached in SQLite with a 60-second freshness window; a stale cached value is served (marked stale) if a live fetch fails, rather than the panel going blank.
 - The proactive alert job fires an email only on an OK→bad transition, never repeatedly while a check stays bad, and covers both CI health and security alerts (Dependabot) — one check throwing must never silence the rest.
@@ -56,7 +56,7 @@ zenvora-admin/                          (new repo)
       backlog.ts                  PRs / issues / stale branches
     deployment/
       dockerProxy.ts              docker-socket-proxy HTTP client
-      drift.ts                    compareDrift() pure logic + GHCR version lookup
+      drift.ts                    compareDrift() staleness logic + GHCR version lookup
       route.ts                    /api/deployment, combines the two above
     alerts/
       job.ts                      recordCheckAndGetTransition() — SQLite-backed state diff
@@ -167,14 +167,9 @@ SMTP_USER=
 SMTP_PASS=
 ALERT_EMAIL_FROM=
 ALERT_EMAIL_TO=
-
-FAMILY_API_TAG=
-SECUREVAULT_API_TAG=
-MEMORIAL_API_TAG=
-MEMORIAL_WORKER_TAG=
 ```
 
-These four reuse the *exact same env var names* `docker-compose.yml` already substitutes into the sibling services' own image lines (`${FAMILY_API_TAG:-latest}` etc.) — when zenvora-admin's `environment:` passthrough resolves them from the same project `.env`/shell source, its notion of "what's pinned" and the actual running deploy's pin are automatically the same value, with no separate copy to keep in sync. There are no `DAYANDYOU_*_TAG` entries: `dayandyou-staging`/`dayandyou-prod` use static, unpinned tags (`:staging`/`:release`) with no per-deploy override variable in `docker-compose.yml` at all — Task 13/19 treat those two as having no pin to check.
+No per-container tag/pin variables here — an earlier draft of this plan tried to mirror `docker-compose.yml`'s own `FAMILY_API_TAG`-style variables into zenvora-admin's own environment, but those only ever exist as one-off shell exports during each product's own separate deploy (see Task 13), so there was never a stable value here to read. Deployment drift (Task 13) is computed entirely from GHCR build recency instead, needing no config here at all.
 
 - [ ] **Step 5: Install dependencies**
 
@@ -1209,7 +1204,11 @@ function fakeOctokit(runsByRepo: Record<string, any>) {
     },
     request: async (route: string) => {
       if (route === 'GET /organizations/{org}/settings/billing/usage') {
-        return { data: { usageItems: [{ product: 'actions', unitType: 'Minutes', quantity: 1700 }] }, includedMinutes: 2000 } as any;
+        // GitHub's real response casing, confirmed against the OpenAPI schema
+        // during review: "Actions" (capitalized product), "minutes" (lowercase
+        // unitType). No "includedMinutes" field exists on this endpoint at all
+        // — see the note in fetchCiHealth below.
+        return { data: { usageItems: [{ product: 'Actions', unitType: 'minutes', quantity: 1700 }] } } as any;
       }
       throw new Error(`unexpected request: ${route}`);
     },
@@ -1286,20 +1285,25 @@ export async function fetchCiHealth(octokit: Octokit, repos: { owner: string; re
 
   // GitHub's old `GET /orgs/{org}/settings/billing/actions` (the typed
   // `octokit.billing.getGithubActionsBillingOrg` helper) now returns 410 Gone —
-  // it was replaced by the "enhanced billing" usage API. Using the untyped
-  // `.request()` escape hatch here since there may not be a typed Octokit
-  // helper for the new endpoint yet. VERIFY THE RESPONSE SHAPE against a real
-  // API call early in implementation — the `usageItems` filter/summation below
-  // is a best-effort reading of GitHub's documented shape, not independently
-  // confirmed, and `actionsMinutesUsed`/`actionsMinutesIncluded` may need
-  // adjusting once checked against a real response.
+  // replaced by this "enhanced billing" usage API. Using the untyped
+  // `.request()` escape hatch since there's no typed Octokit helper for it yet.
+  // Confirmed against GitHub's OpenAPI schema during review: the response has
+  // exactly one field, `usageItems` — a list of cost/usage line items with
+  // `product` ("Actions", capitalized), `unitType` ("minutes", lowercase), and
+  // `quantity`. There is NO quota/allowance field anywhere on this endpoint —
+  // it reports what was used, not what's included. GitHub Free's Actions
+  // minutes allowance for private repos is a plan-tier constant published in
+  // GitHub's docs, not queryable via any API, hence hardcoded below — update
+  // it by hand if the org's plan or GitHub's published limits change.
+  const ACTIONS_MINUTES_INCLUDED_ON_FREE_PLAN = 2000;
+
   const billingResponse = (await octokit.request('GET /organizations/{org}/settings/billing/usage', {
     org: 'ZenvoraAI',
   })) as any;
   const actionsMinutesUsed = (billingResponse.data.usageItems ?? [])
-    .filter((item: any) => item.product === 'actions' && item.unitType === 'Minutes')
+    .filter((item: any) => item.product === 'Actions' && item.unitType === 'minutes')
     .reduce((sum: number, item: any) => sum + item.quantity, 0);
-  const actionsMinutesIncluded = billingResponse.includedMinutes ?? 2000;
+  const actionsMinutesIncluded = ACTIONS_MINUTES_INCLUDED_ON_FREE_PLAN;
 
   return {
     repos: runs,
@@ -1745,16 +1749,24 @@ git commit -m "feat: add docker-socket-proxy client for reading container state"
 
 ---
 
-### Task 13: GHCR tag comparison (drift signals)
+### Task 13: GHCR staleness comparison (drift signals)
 
 **Files:**
 - Create: `src/deployment/drift.ts`
 - Test: `tests/deployment/drift.test.ts`
 
 **Interfaces:**
-- Produces: `PinnedContainer { name, ghcrPackage, pinnedTag }`, `GhcrVersion { tag, createdAt }`, `DriftSignal` (discriminated union: `ok` | `fault` | `upgrade_available`), `compareDrift(pinned, runningTag, latestGhcrVersion): DriftSignal`, `fetchLatestGhcrVersion(octokit, packageName): Promise<GhcrVersion | null>` — both consumed by Task 14.
+- Produces: `TrackedContainer { name, ghcrPackage, ghcrTagFilter? }`, `GhcrVersion { tag, createdAt }`, `DriftSignal` (discriminated union: `ok` | `fault` | `upgrade_available`), `compareDrift(runningTag, latestGhcrVersion): DriftSignal`, `fetchLatestGhcrVersion(octokit, packageName, tagFilter?): Promise<GhcrVersion | null>` — both consumed by Task 14.
 
-This compares **tags**, not content digests. `family-api`, `securevault-api`, `memorial-api`, and `memorial-worker` are pinned in `docker-compose.yml` via a tag env var (`${FAMILY_API_TAG:-latest}` etc.) whose value is a commit SHA — the SHA *is* the tag, immutable per build, not a separate `sha256:` manifest digest. `dayandyou-staging` and `dayandyou-prod` use static `:staging`/`:release` tags with **no** per-deploy pin override in `docker-compose.yml` at all — for those two, `pinnedTag` is `null`, and `compareDrift` must never report `fault` for them (there is nothing to have drifted from), only `ok`/`upgrade_available`.
+**This design changed after a second review round found the original one unbuildable.** The plan previously compared the running tag against a "pinned" tag read from an env var mirroring `docker-compose.yml`'s own tag variables (`FAMILY_API_TAG` etc.). Tracing the actual deploy mechanism in `homelab-infra/README.md` ("Normal deployment model") shows those variables are `export`ed ad hoc inside a one-off SSH session during each product's *own* separate deploy (`export FAMILY_API_TAG=<sha>; docker compose up -d <service>`) — nothing persists them to a file `zenvora-admin`'s own, separately-started container could read at its own startup. There is no durable "pinned" value anywhere on this host to compare against; building one (e.g. tracking observed-tag history in SQLite) would add real complexity for a benefit this single-operator tool doesn't clearly need yet.
+
+Instead, drift is now a **staleness** signal computed entirely from data that actually exists: how old is the newest available GHCR build relative to what's currently running.
+
+- `ok`: the running tag already matches the newest GHCR build.
+- `upgrade_available`: a newer build exists, but it's recent (within `STALE_THRESHOLD_MS`, default 48h) — informational, a deploy just hasn't caught up yet, normal.
+- `fault`: a newer build has existed for longer than the threshold and still isn't running — worth alarming about, since something is likely stuck (a failed/forgotten deploy), not just "hasn't happened yet."
+
+This also fixes the `dayandyou-staging`/`dayandyou-prod` ambiguity from the first review round (both share the `dayandyou` GHCR package): `fetchLatestGhcrVersion` now takes an optional `tagFilter` so each of the two can ask for "the newest version tagged `staging`" vs "the newest version tagged `release`" independently, instead of one shared "newest overall" query that only ever reflects whichever channel was built more recently.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1763,37 +1775,33 @@ This compares **tags**, not content digests. `family-api`, `securevault-api`, `m
 import { describe, test, expect } from 'bun:test';
 import { compareDrift, fetchLatestGhcrVersion } from '../../src/deployment/drift';
 
+const HOUR_MS = 60 * 60 * 1000;
+const now = () => new Date().toISOString();
+const hoursAgo = (h: number) => new Date(Date.now() - h * HOUR_MS).toISOString();
+
 describe('compareDrift', () => {
-  const pinned = { name: 'family-api', ghcrPackage: 'family-media-api', pinnedTag: 'abc123' };
-
-  test('flags a fault when the running tag does not match the pin', () => {
-    const signal = compareDrift(pinned, 'oldtag', { tag: 'abc123', createdAt: '2026-08-16T00:00:00Z' });
-    expect(signal).toEqual({ kind: 'fault', runningTag: 'oldtag', pinnedTag: 'abc123' });
-  });
-
-  test('flags upgrade-available when the pin is correct but GHCR has something newer', () => {
-    const signal = compareDrift(pinned, 'abc123', { tag: 'def456', createdAt: '2026-08-16T00:00:00Z' });
-    expect(signal).toEqual({ kind: 'upgrade_available', pinnedTag: 'abc123', latestTag: 'def456' });
-  });
-
-  test('reports ok when the running tag matches the pin and nothing newer exists', () => {
-    const signal = compareDrift(pinned, 'abc123', { tag: 'abc123', createdAt: '2026-08-16T00:00:00Z' });
+  test('reports ok when the running tag already matches the newest build', () => {
+    const signal = compareDrift('abc123', { tag: 'abc123', createdAt: now() });
     expect(signal).toEqual({ kind: 'ok' });
   });
 
-  test('never reports a fault for a container with no pin mechanism (e.g. dayandyou)', () => {
-    const unpinned = { name: 'dayandyou-staging', ghcrPackage: 'dayandyou', pinnedTag: null };
+  test('reports upgrade_available when a newer build exists but is recent', () => {
+    const signal = compareDrift('oldtag', { tag: 'newtag', createdAt: hoursAgo(2) });
+    expect(signal).toEqual({ kind: 'upgrade_available', runningTag: 'oldtag', latestTag: 'newtag' });
+  });
 
-    const matching = compareDrift(unpinned, 'staging', { tag: 'staging', createdAt: '2026-08-16T00:00:00Z' });
-    expect(matching).toEqual({ kind: 'ok' });
+  test('escalates to fault once the newer build has existed past the staleness threshold', () => {
+    const signal = compareDrift('oldtag', { tag: 'newtag', createdAt: hoursAgo(72) });
+    expect(signal).toEqual({ kind: 'fault', runningTag: 'oldtag', latestTag: 'newtag', latestBuiltAt: hoursAgo(72) });
+  });
 
-    const withUpgrade = compareDrift(unpinned, 'staging-old', { tag: 'staging-new', createdAt: '2026-08-16T00:00:00Z' });
-    expect(withUpgrade.kind).toBe('upgrade_available');
+  test('reports ok when there is no GHCR version info at all (nothing to compare against)', () => {
+    expect(compareDrift('abc123', null)).toEqual({ kind: 'ok' });
   });
 });
 
 describe('fetchLatestGhcrVersion', () => {
-  test('returns the most recently created version and its tag', async () => {
+  test('returns the most recently created version when no tagFilter is given', async () => {
     const octokit = {
       packages: {
         getAllPackageVersionsForPackageOwnedByOrg: async () => ({
@@ -1804,15 +1812,18 @@ describe('fetchLatestGhcrVersion', () => {
     expect(await fetchLatestGhcrVersion(octokit as any, 'family-media-api')).toEqual({ tag: 'abc123', createdAt: '2026-08-16T00:00:00Z' });
   });
 
-  test('returns a null tag when the version has no tags (untagged/dangling)', async () => {
+  test('with a tagFilter, returns the newest version carrying that specific tag — not just the newest overall', async () => {
     const octokit = {
       packages: {
         getAllPackageVersionsForPackageOwnedByOrg: async () => ({
-          data: [{ metadata: { container: { tags: [] } }, created_at: '2026-08-16T00:00:00Z' }],
+          data: [
+            { metadata: { container: { tags: ['release-only'] } }, created_at: '2026-08-16T12:00:00Z' },
+            { metadata: { container: { tags: ['staging'] } }, created_at: '2026-08-16T06:00:00Z' },
+          ],
         }),
       },
     };
-    expect(await fetchLatestGhcrVersion(octokit as any, 'family-media-api')).toEqual({ tag: null, createdAt: '2026-08-16T00:00:00Z' });
+    expect(await fetchLatestGhcrVersion(octokit as any, 'dayandyou', 'staging')).toEqual({ tag: 'staging', createdAt: '2026-08-16T06:00:00Z' });
   });
 
   test('returns null when the package has no versions', async () => {
@@ -1832,11 +1843,11 @@ Expected: FAIL — module not found.
 ```ts
 import type { Octokit } from '@octokit/rest';
 
-export interface PinnedContainer {
+export interface TrackedContainer {
   name: string;
   ghcrPackage: string;
-  /** null for containers with no per-deploy pin mechanism (dayandyou-staging/-prod) */
-  pinnedTag: string | null;
+  /** only needed when multiple containers share one GHCR package, e.g. dayandyou's staging/release channels */
+  ghcrTagFilter?: string;
 }
 
 export interface GhcrVersion {
@@ -1846,39 +1857,44 @@ export interface GhcrVersion {
 
 export type DriftSignal =
   | { kind: 'ok' }
-  | { kind: 'fault'; runningTag: string; pinnedTag: string }
-  | { kind: 'upgrade_available'; pinnedTag: string | null; latestTag: string };
+  | { kind: 'upgrade_available'; runningTag: string; latestTag: string }
+  | { kind: 'fault'; runningTag: string; latestTag: string; latestBuiltAt: string };
 
-export function compareDrift(
-  pinned: PinnedContainer,
-  runningTag: string,
-  latestGhcrVersion: GhcrVersion | null
-): DriftSignal {
-  if (pinned.pinnedTag !== null && runningTag !== pinned.pinnedTag) {
-    return { kind: 'fault', runningTag, pinnedTag: pinned.pinnedTag };
+const STALE_THRESHOLD_MS = 48 * 60 * 60 * 1000;
+
+export function compareDrift(runningTag: string, latestGhcrVersion: GhcrVersion | null): DriftSignal {
+  if (!latestGhcrVersion?.tag || latestGhcrVersion.tag === runningTag) {
+    return { kind: 'ok' };
   }
-  if (latestGhcrVersion?.tag && latestGhcrVersion.tag !== runningTag) {
-    return { kind: 'upgrade_available', pinnedTag: pinned.pinnedTag, latestTag: latestGhcrVersion.tag };
+
+  const ageMs = Date.now() - new Date(latestGhcrVersion.createdAt).getTime();
+  if (ageMs > STALE_THRESHOLD_MS) {
+    return { kind: 'fault', runningTag, latestTag: latestGhcrVersion.tag, latestBuiltAt: latestGhcrVersion.createdAt };
   }
-  return { kind: 'ok' };
+  return { kind: 'upgrade_available', runningTag, latestTag: latestGhcrVersion.tag };
 }
 
-export async function fetchLatestGhcrVersion(octokit: Octokit, packageName: string): Promise<GhcrVersion | null> {
+export async function fetchLatestGhcrVersion(
+  octokit: Octokit,
+  packageName: string,
+  tagFilter?: string
+): Promise<GhcrVersion | null> {
   const { data: versions } = await octokit.packages.getAllPackageVersionsForPackageOwnedByOrg({
     org: 'ZenvoraAI',
     package_type: 'container',
     package_name: packageName,
-    per_page: 1,
+    per_page: tagFilter ? 30 : 1,
   });
 
-  const latest = versions[0] as any;
-  if (!latest) return null;
-  // A container package version's tags live at `metadata.container.tags` per
-  // GitHub's documented package-version shape — VERIFY THIS against a real API
-  // call early in implementation (Task 21's GitHub App setup step is a natural
-  // point to do this), since it wasn't independently confirmed during review.
-  const tag: string | null = latest.metadata?.container?.tags?.[0] ?? null;
-  return { tag, createdAt: latest.created_at };
+  const match = tagFilter
+    ? (versions as any[]).find((v) => v.metadata?.container?.tags?.includes(tagFilter))
+    : (versions as any[])[0];
+
+  if (!match) return null;
+  // A container package version's tags live at `metadata.container.tags` —
+  // confirmed against GitHub's documented package-version schema during review.
+  const tag: string | null = match.metadata?.container?.tags?.[0] ?? null;
+  return { tag, createdAt: match.created_at };
 }
 ```
 
@@ -1891,7 +1907,7 @@ Expected: PASS
 
 ```bash
 git add -A
-git commit -m "feat: add drift comparison logic (fault vs upgrade-available signals)"
+git commit -m "feat: add GHCR staleness comparison logic (fault vs upgrade-available signals)"
 ```
 
 ---
@@ -1903,8 +1919,8 @@ git commit -m "feat: add drift comparison logic (fault vs upgrade-available sign
 - Test: `tests/deployment/route.test.ts`
 
 **Interfaces:**
-- Consumes: `listRunningContainers` (Task 12), `compareDrift`/`fetchLatestGhcrVersion`/`PinnedContainer` (Task 13), `cachedFetch` (Task 7).
-- Produces: `fetchDeploymentDrift(octokit, pinned)`, `createDeploymentRoute(app, db, octokitFor, pinned)` — mounted at `/deployment` (becomes `/api/deployment` once Task 19 mounts this sub-app under `/api`).
+- Consumes: `listRunningContainers` (Task 12), `compareDrift`/`fetchLatestGhcrVersion`/`TrackedContainer` (Task 13), `cachedFetch` (Task 7).
+- Produces: `fetchDeploymentDrift(octokit, tracked)`, `createDeploymentRoute(app, db, octokitFor, tracked)` — mounted at `/deployment` (becomes `/api/deployment` once Task 19 mounts this sub-app under `/api`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1923,12 +1939,12 @@ const { openDb } = await import('../../src/db/client');
 const { createDeploymentRoute } = await import('../../src/deployment/route');
 
 describe('GET /deployment', () => {
-  test('reports a container matching its pin as ok', async () => {
+  test('reports a container already running the newest build as ok', async () => {
     const db = openDb(':memory:');
     const octokit = {
       packages: {
         getAllPackageVersionsForPackageOwnedByOrg: async () => ({
-          data: [{ metadata: { container: { tags: ['abc123'] } }, created_at: '2026-08-16T00:00:00Z' }],
+          data: [{ metadata: { container: { tags: ['abc123'] } }, created_at: new Date().toISOString() }],
         }),
       },
     };
@@ -1936,7 +1952,7 @@ describe('GET /deployment', () => {
     const app = new Hono();
     app.use('*', async (c, next) => { c.set('githubToken', 'ghu_x'); await next(); });
     createDeploymentRoute(app, db, () => octokit as any, [
-      { name: 'homelab-family-api', ghcrPackage: 'family-media-api', pinnedTag: 'abc123' },
+      { name: 'homelab-family-api', ghcrPackage: 'family-media-api' },
     ]);
 
     const res = await app.request('/deployment');
@@ -1946,12 +1962,12 @@ describe('GET /deployment', () => {
     db.close();
   });
 
-  test('reports a container with no pin mechanism (dayandyou) as ok when tags match, never as a fault', async () => {
+  test('a container with no running instance is treated as maximally behind, not silently skipped', async () => {
     const db = openDb(':memory:');
     const octokit = {
       packages: {
         getAllPackageVersionsForPackageOwnedByOrg: async () => ({
-          data: [{ metadata: { container: { tags: ['staging'] } }, created_at: '2026-08-16T00:00:00Z' }],
+          data: [{ metadata: { container: { tags: ['def456'] } }, created_at: new Date().toISOString() }],
         }),
       },
     };
@@ -1959,13 +1975,13 @@ describe('GET /deployment', () => {
     const app = new Hono();
     app.use('*', async (c, next) => { c.set('githubToken', 'ghu_x'); await next(); });
     createDeploymentRoute(app, db, () => octokit as any, [
-      { name: 'homelab-family-api', ghcrPackage: 'dayandyou', pinnedTag: null },
+      { name: 'not-actually-running', ghcrPackage: 'family-media-api' },
     ]);
 
     const res = await app.request('/deployment');
     const body = await res.json();
 
-    expect(body.data[0].signal.kind).not.toBe('fault');
+    expect(body.data[0].signal.kind).not.toBe('ok');
     db.close();
   });
 });
@@ -1984,20 +2000,21 @@ import type { Database } from 'bun:sqlite';
 import type { Octokit } from '@octokit/rest';
 import { cachedFetch } from '../github/cache';
 import { listRunningContainers } from './dockerProxy';
-import { compareDrift, fetchLatestGhcrVersion, type PinnedContainer } from './drift';
+import { compareDrift, fetchLatestGhcrVersion, type TrackedContainer } from './drift';
 
-export async function fetchDeploymentDrift(octokit: Octokit, pinned: PinnedContainer[]) {
+export async function fetchDeploymentDrift(octokit: Octokit, tracked: TrackedContainer[]) {
   const running = await listRunningContainers();
 
   return Promise.all(
-    pinned.map(async (p) => {
-      const runningContainer = running.find((r) => r.name === p.name);
-      const latest = await fetchLatestGhcrVersion(octokit, p.ghcrPackage);
-      // a container that isn't running at all has no real tag to compare — 'unknown'
-      // guarantees a fault for pinned services (correct: it's not running what it
-      // should be) and just an informational upgrade_available for unpinned ones
-      const signal = compareDrift(p, runningContainer?.imageTag ?? 'unknown', latest);
-      return { container: p.name, signal };
+    tracked.map(async (t) => {
+      const runningContainer = running.find((r) => r.name === t.name);
+      const latest = await fetchLatestGhcrVersion(octokit, t.ghcrPackage, t.ghcrTagFilter);
+      // a container that isn't running at all has no real tag to compare —
+      // 'not-running' can never equal latest.tag, so this always yields
+      // upgrade_available or fault (never a false ok), which is correct: a
+      // container that isn't running is never "caught up"
+      const signal = compareDrift(runningContainer?.imageTag ?? 'not-running', latest);
+      return { container: t.name, signal };
     })
   );
 }
@@ -2006,11 +2023,11 @@ export function createDeploymentRoute(
   app: Hono,
   db: Database,
   octokitFor: (token: string) => Octokit,
-  pinned: PinnedContainer[]
+  tracked: TrackedContainer[]
 ) {
   app.get('/deployment', async (c) => {
     const octokit = octokitFor(c.get('githubToken') as string);
-    const result = await cachedFetch(db, 'deployment-drift', () => fetchDeploymentDrift(octokit, pinned));
+    const result = await cachedFetch(db, 'deployment-drift', () => fetchDeploymentDrift(octokit, tracked));
     return c.json({ data: result.data, stale: result.stale });
   });
 }
@@ -2025,7 +2042,7 @@ Expected: PASS
 
 ```bash
 git add -A
-git commit -m "feat: add deployment drift endpoint (per-container fault vs upgrade signal)"
+git commit -m "feat: add deployment drift endpoint (staleness-based fault vs upgrade signal)"
 ```
 
 ---
@@ -2625,14 +2642,14 @@ describe('DeploymentDrift', () => {
   test('visually distinguishes a fault from an upgrade-available signal', async () => {
     globalThis.fetch = mock(async () => new Response(JSON.stringify({
       data: [
-        { container: 'homelab-family-api', signal: { kind: 'fault', runningTag: 'oldtag', pinnedTag: 'abc123' } },
-        { container: 'homelab-securevault-api', signal: { kind: 'upgrade_available', pinnedTag: 'abc123', latestTag: 'def456' } },
+        { container: 'homelab-family-api', signal: { kind: 'fault', runningTag: 'oldtag', latestTag: 'abc123', latestBuiltAt: '2026-08-10T00:00:00Z' } },
+        { container: 'homelab-securevault-api', signal: { kind: 'upgrade_available', runningTag: 'abc123', latestTag: 'def456' } },
       ],
       stale: false,
     }), { status: 200 })) as any;
 
     render(<DeploymentDrift />);
-    await waitFor(() => expect(screen.getByText(/DRIFT/)).toBeDefined());
+    await waitFor(() => expect(screen.getByText(/stale for a while/)).toBeDefined());
     expect(screen.getByText(/newer image available/)).toBeDefined();
   });
 });
@@ -2757,8 +2774,8 @@ import { useApiData } from '../hooks/useApiData';
 
 type DriftSignal =
   | { kind: 'ok' }
-  | { kind: 'fault'; runningTag: string; pinnedTag: string }
-  | { kind: 'upgrade_available'; pinnedTag: string | null; latestTag: string };
+  | { kind: 'upgrade_available'; runningTag: string; latestTag: string }
+  | { kind: 'fault'; runningTag: string; latestTag: string; latestBuiltAt: string };
 
 interface DeploymentRow { container: string; signal: DriftSignal; }
 
@@ -2775,7 +2792,7 @@ export function DeploymentDrift() {
       <ul>
         {state.data.map((row) => (
           <li key={row.container} className={row.signal.kind === 'fault' ? 'status-fault' : row.signal.kind === 'upgrade_available' ? 'status-upgrade' : 'status-ok'}>
-            {row.container}: {row.signal.kind === 'fault' ? 'DRIFT — running image does not match pin' : row.signal.kind === 'upgrade_available' ? 'newer image available on GHCR' : 'matches pin'}
+            {row.container}: {row.signal.kind === 'fault' ? `stale for a while — still running an older build (newest built ${row.signal.latestBuiltAt})` : row.signal.kind === 'upgrade_available' ? 'newer image available on GHCR' : 'up to date'}
           </li>
         ))}
       </ul>
@@ -3003,7 +3020,7 @@ import { fetchRepoSecurityStatus } from './github/security';
 import { mountStaticFrontend } from './static';
 import { startAlertScheduler, type AlertCheck } from './alerts/scheduler';
 import type { AppVariables } from './types';
-import type { PinnedContainer } from './deployment/drift';
+import type { TrackedContainer } from './deployment/drift';
 
 const REPOS = [
   { owner: 'qclawchang', repo: 'homelab-infra' },
@@ -3014,17 +3031,18 @@ const REPOS = [
   { owner: 'ZenvoraAI', repo: 'aws-infrastructure' },
 ];
 
-const PINNED_CONTAINERS: PinnedContainer[] = [
-  { name: 'homelab-family-api', ghcrPackage: 'family-media-api', pinnedTag: process.env.FAMILY_API_TAG ?? null },
-  { name: 'homelab-securevault-api', ghcrPackage: 'securevault-api', pinnedTag: process.env.SECUREVAULT_API_TAG ?? null },
-  // dayandyou-staging/-prod have no per-deploy pin variable in docker-compose.yml
-  // at all (static :staging/:release tags) — pinnedTag: null means Task 13's
-  // compareDrift can only ever report ok/upgrade_available for these two, never
-  // a fault, since there is nothing pinned to have drifted from.
-  { name: 'homelab-dayandyou-staging', ghcrPackage: 'dayandyou', pinnedTag: null },
-  { name: 'homelab-dayandyou-prod', ghcrPackage: 'dayandyou', pinnedTag: null },
-  { name: 'homelab-memorial-api', ghcrPackage: 'aiqiuqi-memorial-api', pinnedTag: process.env.MEMORIAL_API_TAG ?? null },
-  { name: 'homelab-memorial-worker', ghcrPackage: 'aiqiuqi-memorial-worker', pinnedTag: process.env.MEMORIAL_WORKER_TAG ?? null },
+// No env vars here on purpose — Task 13's redesign dropped the "pinned tag"
+// concept entirely (there's nowhere on this host that value durably lives;
+// see Task 13 for why). Each entry just names the container and the GHCR
+// package to track; dayandyou's two entries add ghcrTagFilter since they
+// share one GHCR package across two channels.
+const TRACKED_CONTAINERS: TrackedContainer[] = [
+  { name: 'homelab-family-api', ghcrPackage: 'family-media-api' },
+  { name: 'homelab-securevault-api', ghcrPackage: 'securevault-api' },
+  { name: 'homelab-dayandyou-staging', ghcrPackage: 'dayandyou', ghcrTagFilter: 'staging' },
+  { name: 'homelab-dayandyou-prod', ghcrPackage: 'dayandyou', ghcrTagFilter: 'release' },
+  { name: 'homelab-memorial-api', ghcrPackage: 'aiqiuqi-memorial-api' },
+  { name: 'homelab-memorial-worker', ghcrPackage: 'aiqiuqi-memorial-worker' },
 ];
 
 export function createApp() {
@@ -3043,7 +3061,7 @@ export function createApp() {
   createCiRoute(api, db, createOctokit, REPOS);
   createSecurityRoute(api, db, createOctokit, REPOS);
   createBacklogRoute(api, db, createOctokit, 'qclawchang', REPOS);
-  createDeploymentRoute(api, db, createOctokit, PINNED_CONTAINERS);
+  createDeploymentRoute(api, db, createOctokit, TRACKED_CONTAINERS);
   app.route('/api', api);
 
   mountStaticFrontend(app);
@@ -3225,7 +3243,7 @@ At `https://github.com/settings/apps/new`:
 - Callback URL: `https://admin.valtou.com/auth/callback`.
 - Repository permissions (read-only): Contents, Metadata, Actions, Dependabot alerts, Secret-scanning alerts.
 - Organization permissions (read-only): Administration (needed for 2FA status and the Actions-usage billing endpoint).
-- **Leave "Expire user authorization tokens" OFF.** It's opt-in, not default. Turning it on would require refresh-token handling that nothing in this plan implements — deliberately out of scope for a single-operator tool with an already-short 12h session TTL and one-click re-login. This is a scope decision, not an oversight: don't "fix" it later by enabling expiration without also adding refresh logic.
+- **Actively uncheck "Expire user authorization tokens."** This setting is **on by default** for a new GitHub App (opt-*out*, not opt-in — confirmed against GitHub's docs during review, correcting an earlier draft of this plan that had the default backwards) — leaving it untouched does the opposite of what's needed here. Unchecking it means tokens don't expire on GitHub's side, which is what lets this plan skip refresh-token handling entirely: deliberately out of scope for a single-operator tool with an already-short 12h session TTL and one-click re-login. This is a scope decision, not an oversight — don't "fix" it later by leaving expiration on without also adding refresh logic.
 - Install the App on **both** the personal account (for `homelab-infra`) and the `ZenvoraAI` organization — two separate installation flows.
 - Copy the generated Client ID and Client Secret; they go into `/opt/secrets/zenvora-admin/.env` in Step 6.
 
@@ -3273,21 +3291,15 @@ At `https://github.com/settings/apps/new`:
     logging: *default-logging
     depends_on:
       - docker-socket-proxy
-    # Only the tag passthroughs live here, resolved from the same project
-    # .env/shell source that already parameterizes the sibling services' own
-    # image lines (${FAMILY_API_TAG:-latest} etc.) — so zenvora-admin's view of
-    # "what's pinned" and the actual running deploy's pin are always the same
-    # value, nothing to keep in sync by hand. Every secret (App credentials,
-    # encryption key, SMTP, the alert-check PAT) lives ONLY in env_file below —
-    # environment: wins over env_file: in Compose, so listing a secret in both
-    # places risks it being silently blanked if the shell/project .env doesn't
-    # also happen to export it.
-    environment:
-      - PORT
-      - FAMILY_API_TAG
-      - SECUREVAULT_API_TAG
-      - MEMORIAL_API_TAG
-      - MEMORIAL_WORKER_TAG
+    # No environment: block at all — everything, including the non-secret
+    # PORT, lives in env_file, matching the memorial-api/memorial-worker
+    # pattern above. A bare `environment: - PORT` passthrough would resolve
+    # from the shell/project .env at `docker compose up` time (not from this
+    # service's own env_file) and, critically, Compose's environment: always
+    # wins over env_file: for the same key — if PORT weren't also exported at
+    # the shell level, that bare passthrough would silently blank it to an
+    # empty string rather than falling back to whatever env_file set, which
+    # would make Bun try to listen on port 0. One file, one source of truth.
     env_file:
       - /opt/secrets/zenvora-admin/.env
     volumes:
@@ -3413,7 +3425,7 @@ git commit -m "docs: document zenvora-admin and docker-socket-proxy in the servi
 - [ ] **Step 9: Manual verification of the one thing this plan can't test automatically** — the real docker-socket-proxy against the real socket, and the GHCR package-version tag shape (per Task 13's note that this wasn't independently confirmed) — both called out in the spec's Testing section as needing a manual check, not an automated end-to-end test.
 
 Log into `https://admin.valtou.com`, complete the GitHub OAuth flow with 2FA enabled on the account, and confirm:
-- The Deployment Drift panel shows all 7 real containers, with `fault`/`ok`/`upgrade_available` signals that make sense against what's actually pinned in `.env` (and never a `fault` for the two `dayandyou` containers).
+- The Deployment Drift panel shows all 6 tracked containers (the 7th running container, `homelab-nginx`, isn't a deployed product image and was never in `TRACKED_CONTAINERS`), with `ok`/`upgrade_available`/`fault` signals that make sense given how recently each was actually built and deployed.
 - The CI Health panel's Actions-quota numbers look plausible against the real enhanced-billing API response (Task 9's note on this being unverified).
 - The Security Posture panel's 2FA line matches the real account state.
 
@@ -3422,6 +3434,6 @@ Log into `https://admin.valtou.com`, complete the GitHub OAuth flow with 2FA ena
 ## Self-review notes
 
 - **Spec coverage:** every spec section maps to a task — Problem/Goals → Tasks 8–15 (the four panels + alert, now covering both CI and security per the alert-scope fix); Auth section → Tasks 4–6, plus Task 21 Step 1 for the actual GitHub App creation, which the first draft of this plan omitted entirely; Architecture (single process, docker-socket-proxy, SQLite) → Tasks 1–2, 12, 16, 19; Feature panels 1–6 → Tasks 8, 9, 10, 14, 11, 15 respectively; Data flow (SQLite cache, stale-on-error, now actually surfaced to the UI) → Task 7 + Task 18; Error handling → Task 7 (stale fallback), each panel's frontend error state, and the login-page rejection-reason rendering (Task 18); Testing section's explicit list → covered 1:1 by each task's test file, plus the strengthened Task 19 integration test that catches route-mount mismatches the original version's 401-only assertion couldn't; Open risks (host memory — resolved in the spec before this plan existed; GitHub App installation scope and the `two_factor_authentication` field's availability for App tokens — both now explicit verification steps in Task 21 Step 1, not left implicit; SMTP credential — Task 21 Step 5).
-- **Placeholder scan:** no TBD/TODO/"add error handling" phrasing anywhere above; every step has real, runnable code. Two points are explicitly marked as needing empirical verification during implementation rather than treated as certain — the enhanced-billing API's response shape (Task 9) and the GHCR package-version tags array shape (Task 13) — both call out exactly what to check and where, rather than silently assuming either is correct.
-- **Type consistency:** `AppVariables` (Task 1) is used consistently by every `Hono<{ Variables: AppVariables }>()` instantiation from Task 6 onward; `createApp()`'s signature change from `Hono` to `{ app, db }` (Task 19) is called out explicitly with the corresponding test update; `PinnedContainer`/`DriftSignal`/`GhcrVersion` (Task 13, now tag-based: `pinnedTag`/`runningTag`/`latestTag`, not digest-based) are the same shapes consumed in Task 14 and mirrored (as plain inline types, not a cross-package import) in the frontend's `DeploymentDrift.tsx` (Task 18). Every panel route (Tasks 8–11, 14) now registers at a path relative to its `/api` mount and returns `{ data, stale }`, consistently unwrapped by the frontend's `useApiData` hook (Task 18) — this replaces the first draft, where routes were registered at absolute `/api/...` paths that Task 19's `app.route('/api', api)` would have silently double-prefixed, undetected by that draft's test because `requireAuth` intercepted before Hono ever looked for a matching route.
-- **This plan was revised once already**, after an independent 3-agent review (security / plan-coverage / library-API-correctness) found 2 CRITICAL bugs (the route double-prefix, and a digest-vs-tag mismatch that would have made every container in the deployment-drift panel report `fault` permanently) plus a cluster of HIGH/MEDIUM findings, all addressed inline above rather than in a separate errata section.
+- **Placeholder scan:** no TBD/TODO/"add error handling" phrasing anywhere above; every step has real, runnable code. The GHCR package-version tags array shape (Task 13) was independently confirmed correct against GitHub's OpenAPI schema during review; the enhanced-billing API's response shape (Task 9) was independently confirmed and corrected (wrong field, wrong casing) during review, not left as an open question.
+- **Type consistency:** `AppVariables` (Task 1) is used consistently by every `Hono<{ Variables: AppVariables }>()` instantiation from Task 6 onward; `createApp()`'s signature change from `Hono` to `{ app, db }` (Task 19) is called out explicitly with the corresponding test update; `TrackedContainer`/`DriftSignal`/`GhcrVersion` (Task 13, staleness-based: `runningTag`/`latestTag`/`latestBuiltAt`, no pin concept at all) are the same shapes consumed in Task 14 and mirrored (as plain inline types, not a cross-package import) in the frontend's `DeploymentDrift.tsx` (Task 18). Every panel route (Tasks 8–11, 14) now registers at a path relative to its `/api` mount and returns `{ data, stale }`, consistently unwrapped by the frontend's `useApiData` hook (Task 18) — this replaces the first draft, where routes were registered at absolute `/api/...` paths that Task 19's `app.route('/api', api)` would have silently double-prefixed, undetected by that draft's test because `requireAuth` intercepted before Hono ever looked for a matching route.
+- **This plan went through two rounds of independent 3-agent review**, each round re-reading the plan fresh (security / plan-coverage / library-API-correctness lenses). Round 1 found 2 CRITICAL bugs (the route double-prefix, and a digest-vs-tag mismatch that would have made every pinned container report `fault` permanently) plus a cluster of HIGH/MEDIUM findings. Round 2 verified those fixes and found that the round-1 fix for deployment drift, while correcting digest-vs-tag, still didn't work: it read a "pinned tag" from env vars that (per `homelab-infra/README.md`'s actual deploy model) only ever exist as one-off shell exports during another service's separate deploy, never as a value `zenvora-admin` could durably read. Task 13 was redesigned a second time around GHCR build-recency instead, which needs no external pin state at all. Round 2 also caught the billing endpoint's response shape being confirmed wrong (not just unverified) and a default-state error in the GitHub App token-expiration instructions. All of it is addressed inline above.
