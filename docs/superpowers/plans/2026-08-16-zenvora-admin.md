@@ -2986,12 +2986,21 @@ describe('createApp wiring', () => {
       'INSERT INTO sessions (id, user_id, encrypted_token, created_at, expires_at) VALUES (?, ?, ?, ?, ?)'
     ).run(sessionId, 4242, encryptToken('ghu_fake'), Date.now(), Date.now() + 60_000);
 
+    // This makes real outbound calls (GitHub API with a fake token, and the
+    // docker-socket-proxy at DOCKER_PROXY_URL, neither of which is mocked
+    // here) rather than staying fully hermetic — accepted deliberately for
+    // this one test, since GitHub Actions runners have network egress and the
+    // point is specifically to prove routing reaches a real handler, not to
+    // assert on what that handler returns. If this becomes flaky in CI,
+    // inject fake octokit/proxy clients through createApp() instead of
+    // reaching for a shortcut that would silently stop testing the real
+    // wiring.
     for (const path of ['/api/repos', '/api/ci', '/api/security', '/api/backlog', '/api/deployment']) {
       const res = await app.request(path, { headers: { cookie: `zenvora_session=${sessionId}` } });
-      // a real GitHub call will fail without network access (500/502) or hang
-      // on a real fetch attempt that this test doesn't mock — either way, the
-      // one status that would mean "route not found" is 404, and that's the
-      // one this test exists to rule out.
+      // a real GitHub/docker-socket-proxy call will fail without a valid
+      // token/reachable proxy (500/502) — either way, the one status that
+      // would mean "route not found" is 404, and that's the one this test
+      // exists to rule out.
       expect(res.status).not.toBe(404);
     }
   });
