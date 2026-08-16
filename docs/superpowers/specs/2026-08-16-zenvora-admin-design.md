@@ -201,12 +201,19 @@ single `proxy_pass` location block, no restart-sensitive volume change.
 
 ## Open risks / things to verify during implementation
 
-- **Host memory, recompute before deploying.** Current commitment is 2,286MB against
-  a ~1.9–2GB host. Adding this app's backend (~128m) plus the socket-proxy sidecar
-  (~16m) brings committed `mem_limit` to roughly 2,430MB — worse, not better, than the
-  already-tight baseline. Run `free -h` and `docker stats` on the real host before
-  wiring this into `docker-compose.yml`; if there's no real headroom, either trim an
-  existing service's `mem_limit` or reconsider hosting this off-host after all.
+- **Host memory — verified 2026-08-16, proceeds.** Measured on the real host:
+  `free -h` shows 1.9Gi total, 906Mi used, **752Mi available**; `docker stats
+  --no-stream` shows actual combined container usage is only ~660MB (vs. the
+  2,286MB their `mem_limit` ceilings sum to — those ceilings are far from being hit
+  simultaneously in practice). zenvora-admin's backend (~128m) plus the
+  socket-proxy sidecar (~16m) is ~144MB, comfortably inside the 752MB available.
+  Two things to keep an eye on, not blockers: `homelab-memorial-api` is already at
+  89.5% of its own 192m ceiling (171.9MiB/192MiB) — the container closest to an
+  OOM-kill if it grows, independent of this project; and the worst-case ceiling
+  arithmetic (every container simultaneously at its own cap) rises from 2,286MB to
+  ~2,430MB against the 1.9GB host, which the 2.8GB of free swap would absorb as
+  slowdown rather than a crash, consistent with the README's framing of `mem_limit`
+  as a ceiling rather than a reservation.
 - GitHub App installation covers both the org (`ZenvoraAI`) and the personal account
   (`homelab-infra`) — confirm the user-to-server token actually carries read access to
   both during implementation; App installation scope across a personal account vs an
