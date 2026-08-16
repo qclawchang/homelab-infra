@@ -47,7 +47,7 @@ services:
       - /var/lib/homelab-acme:/var/www/certbot:ro
     mem_limit: 64m
   api:
-    image: ghcr.io/${GHCR_OWNER:-zenvoraai}/family-media-api:latest
+    image: ghcr.io/${GHCR_OWNER:-zenvoraai}/family-media-api:${FAMILY_API_TAG:-latest}
     container_name: homelab-family-api
     network_mode: host
     restart: unless-stopped
@@ -56,7 +56,7 @@ services:
       - /opt/secrets/family-media/.env:/app/.env:ro
     mem_limit: 640m
   securevault-api:
-    image: ghcr.io/${GHCR_OWNER:-zenvoraai}/securevault-api:latest
+    image: ghcr.io/${GHCR_OWNER:-zenvoraai}/securevault-api:${SECUREVAULT_API_TAG:-latest}
     container_name: homelab-securevault-api
     network_mode: host
     restart: unless-stopped
