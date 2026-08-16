@@ -138,12 +138,19 @@ single `proxy_pass` location block, no restart-sensitive volume change.
 4. **Deployment drift** — modeled **per running container**, not per repo (6 repos map
    to 7 containers today; two repos have none, one has two). Reads container state via
    the docker-socket-proxy and reports two *distinct* signals, not one conflated
-   "drift" flag:
-   - **Fault signal**: the container's actually-running image digest doesn't match the
-     SHA pinned for it in `docker-compose.yml` — this means a deploy didn't apply or a
-     container restarted onto a stale image. This is the one that should look alarming.
+   "drift" flag. Comparison is by **tag, not content digest** — this repo's
+   SHA-pinned services (`family-api`, `securevault-api`, `memorial-api`,
+   `memorial-worker`) pin via a tag env var whose value *is* a commit SHA, not a
+   separate manifest digest, and `dayandyou-staging`/`dayandyou-prod` have **no**
+   per-deploy pin mechanism in `docker-compose.yml` at all (static `:staging`/
+   `:release` tags) — for those two, only the upgrade-available signal is possible,
+   never the fault signal, since there's nothing pinned to have drifted from.
+   - **Fault signal**: the container's actually-running image tag doesn't match the
+     tag pinned for it in `docker-compose.yml` (only possible where a pin exists) —
+     this means a deploy didn't apply or a container restarted onto a stale image.
+     This is the one that should look alarming.
    - **Upgrade-available signal**: GHCR has a newer image version than the one
-     currently pinned (found by listing package versions ordered by creation — GHCR
+     currently running (found by listing package versions ordered by creation — GHCR
      has no literal "latest tag" endpoint, so "latest" is inferred as most-recently-
      created). This is informational, not a fault, and must be visually distinct from
      the fault signal above.

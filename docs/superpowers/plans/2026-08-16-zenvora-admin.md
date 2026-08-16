@@ -17,12 +17,14 @@
 - Auth is a **GitHub App** with fine-grained read-only permissions, never a classic OAuth App (`repo` scope grants write access, which the spec explicitly rejects).
 - Every OAuth callback validates a CSRF `state` parameter generated per login attempt.
 - Login requires both: (1) the authenticated GitHub user's **immutable numeric ID** matches a single whitelisted ID, and (2) that GitHub account's `two_factor_authentication` field is `true`. Both fail closed.
-- Sessions live in SQLite; the cookie holds only an opaque session ID (httpOnly, secure, `SameSite=Lax`), never the GitHub token itself. Revocation is a row delete.
+- Sessions live in SQLite; the cookie holds only an opaque session ID (httpOnly, secure, `SameSite=Strict`), never the GitHub token itself. Revocation is a row delete.
 - Docker state is read only via the `docker-socket-proxy` sidecar's `GET /containers/*` — the backend never mounts `/var/run/docker.sock` directly.
-- Deployment drift reports two distinct signals per container, never conflated: `fault` (running digest ≠ pinned digest) and `upgrade_available` (GHCR has something newer than the pin).
+- Deployment drift compares **tags**, not content digests (the repo's SHA-pinned services use the SHA as the tag itself), and reports two distinct signals per container, never conflated: `fault` (running tag ≠ pinned tag — only possible when a pin exists) and `upgrade_available` (GHCR has something newer than what's running). Two of the six containers (`dayandyou-staging`/`-prod`) have no pin mechanism at all and can only ever report `ok`/`upgrade_available`, never `fault`.
 - Branch protection and secret scanning both render `unavailable_on_plan`, not a false negative — GitHub Free cannot enable either on private repos.
 - GitHub API responses are cached in SQLite with a 60-second freshness window; a stale cached value is served (marked stale) if a live fetch fails, rather than the panel going blank.
-- The proactive alert job fires an email only on an OK→bad transition, never repeatedly while a check stays bad.
+- The proactive alert job fires an email only on an OK→bad transition, never repeatedly while a check stays bad, and covers both CI health and security alerts (Dependabot) — one check throwing must never silence the rest.
+- Panel routes (Tasks 8–11, 14) register at paths *relative* to their `/api` mount point (e.g. `/repos`, not `/api/repos`) — Task 19 mounts the whole sub-app under `/api` via `app.route('/api', api)`, so an absolute path there would double the prefix.
+- Every GitHub-facing endpoint response is wrapped as `{ data, stale }`, and the frontend actually renders the stale case — this is the concrete reason SQLite backs the cache instead of a plain in-memory TTL.
 - No task in this plan performs a write action against GitHub or the Docker host — v1 is read-only observability plus the one email side-effect.
 - New repo `ZenvoraAI/zenvora-admin` is private. It deploys into the existing `homelab-infra` `docker-compose.yml`/nginx, hostname `admin.valtou.com`, following that repo's existing "Onboarding a new service" checklist (`homelab-infra/README.md`).
 
@@ -68,8 +70,8 @@ zenvora-admin/                          (new repo)
       hooks/useApiData.ts
       styles/tokens.css
       components/
-        RepoGrid.tsx, CiHealth.tsx, SecurityPosture.tsx, DeploymentDrift.tsx, Backlog.tsx
-        __tests__/panels.test.tsx
+        RepoGrid.tsx, CiHealth.tsx, SecurityPosture.tsx, DeploymentDrift.tsx, Backlog.tsx, LoginGate.tsx
+        __tests__/panels.test.tsx, __tests__/loginGate.test.tsx
 
 homelab-infra/                          (this repo — modified, not created)
   docker-compose.yml                    + docker-socket-proxy, + zenvora-admin services
@@ -166,13 +168,13 @@ SMTP_PASS=
 ALERT_EMAIL_FROM=
 ALERT_EMAIL_TO=
 
-FAMILY_API_DIGEST=
-SECUREVAULT_API_DIGEST=
-DAYANDYOU_STAGING_DIGEST=
-DAYANDYOU_PROD_DIGEST=
-MEMORIAL_API_DIGEST=
-MEMORIAL_WORKER_DIGEST=
+FAMILY_API_TAG=
+SECUREVAULT_API_TAG=
+MEMORIAL_API_TAG=
+MEMORIAL_WORKER_TAG=
 ```
+
+These four reuse the *exact same env var names* `docker-compose.yml` already substitutes into the sibling services' own image lines (`${FAMILY_API_TAG:-latest}` etc.) — when zenvora-admin's `environment:` passthrough resolves them from the same project `.env`/shell source, its notion of "what's pinned" and the actual running deploy's pin are automatically the same value, with no separate copy to keep in sync. There are no `DAYANDYOU_*_TAG` entries: `dayandyou-staging`/`dayandyou-prod` use static, unpinned tags (`:staging`/`:release`) with no per-deploy override variable in `docker-compose.yml` at all — Task 13/19 treat those two as having no pin to check.
 
 - [ ] **Step 5: Install dependencies**
 
@@ -583,40 +585,49 @@ describe('GET /auth/callback', () => {
     db.close();
   });
 
-  test('rejects a non-whitelisted user id', async () => {
+  test('rejects a non-whitelisted user id by redirecting to the login page with a reason', async () => {
     const db = openDb(':memory:');
     db.query('INSERT INTO oauth_states (state, created_at) VALUES (?, ?)').run('good-state', Date.now());
     const app = new Hono();
     createOAuthCallbackRoute(app, db, fakeClient({ id: 9999, login: 'someone-else', two_factor_authentication: true }));
 
-    const res = await app.request('/auth/callback?code=abc&state=good-state');
+    const res = await app.request('/auth/callback?code=abc&state=good-state', { redirect: 'manual' });
 
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(302);
+    const location = new URL(res.headers.get('location')!, 'https://admin.valtou.com');
+    expect(location.pathname).toBe('/login');
+    expect(location.searchParams.get('error')).toContain('not authorized');
     expect(db.query('SELECT * FROM sessions').all()).toHaveLength(0);
     db.close();
   });
 
-  test('rejects a whitelisted user without 2FA enabled', async () => {
+  test('rejects a whitelisted user without 2FA enabled by redirecting to the login page with a reason', async () => {
     const db = openDb(':memory:');
     db.query('INSERT INTO oauth_states (state, created_at) VALUES (?, ?)').run('good-state', Date.now());
     const app = new Hono();
     createOAuthCallbackRoute(app, db, fakeClient({ id: 4242, login: 'qclawchang', two_factor_authentication: false }));
 
-    const res = await app.request('/auth/callback?code=abc&state=good-state');
+    const res = await app.request('/auth/callback?code=abc&state=good-state', { redirect: 'manual' });
 
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(302);
+    const location = new URL(res.headers.get('location')!, 'https://admin.valtou.com');
+    expect(location.pathname).toBe('/login');
+    expect(location.searchParams.get('error')).toContain('two-factor');
     expect(db.query('SELECT * FROM sessions').all()).toHaveLength(0);
     db.close();
   });
 
-  test('rejects an invalid or already-used state', async () => {
+  test('rejects an invalid or already-used state by redirecting to the login page with a reason', async () => {
     const db = openDb(':memory:');
     const app = new Hono();
     createOAuthCallbackRoute(app, db, fakeClient({ id: 4242, login: 'qclawchang', two_factor_authentication: true }));
 
-    const res = await app.request('/auth/callback?code=abc&state=never-issued');
+    const res = await app.request('/auth/callback?code=abc&state=never-issued', { redirect: 'manual' });
 
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(302);
+    const location = new URL(res.headers.get('location')!, 'https://admin.valtou.com');
+    expect(location.pathname).toBe('/login');
+    expect(location.searchParams.get('error')).toContain('state');
     db.close();
   });
 });
@@ -664,32 +675,36 @@ export function createRealGitHubOAuthClient(): GitHubOAuthClient {
   };
 }
 
+function loginRedirect(reason: string) {
+  return `/login?error=${encodeURIComponent(reason)}`;
+}
+
 export function createOAuthCallbackRoute(app: Hono, db: Database, client: GitHubOAuthClient) {
   app.get('/auth/callback', async (c) => {
     const code = c.req.query('code');
     const state = c.req.query('state');
-    if (!code || !state) return c.text('missing code or state', 400);
+    if (!code || !state) return c.redirect(loginRedirect('missing code or state'));
 
     pruneExpiredStates(db);
     const stateRow = db.query('SELECT state FROM oauth_states WHERE state = ?').get(state);
-    if (!stateRow) return c.text('invalid or expired state', 400);
+    if (!stateRow) return c.redirect(loginRedirect('invalid or expired login state, please try again'));
     db.query('DELETE FROM oauth_states WHERE state = ?').run(state);
 
     let accessToken: string;
     try {
       ({ accessToken } = await client.exchangeCode(code));
     } catch {
-      return c.text('token exchange failed', 502);
+      return c.redirect(loginRedirect('GitHub token exchange failed, please try again'));
     }
 
     const user = await client.fetchUser(accessToken);
 
     const whitelistedId = Number(process.env.WHITELISTED_GITHUB_USER_ID);
     if (user.id !== whitelistedId) {
-      return c.text('this GitHub account is not authorized for zenvora-admin', 403);
+      return c.redirect(loginRedirect('this GitHub account is not authorized for zenvora-admin'));
     }
     if (user.two_factor_authentication !== true) {
-      return c.text('two-factor authentication must be enabled on this GitHub account', 403);
+      return c.redirect(loginRedirect('two-factor authentication must be enabled on this GitHub account'));
     }
 
     const sessionId = randomBytes(24).toString('hex');
@@ -701,12 +716,14 @@ export function createOAuthCallbackRoute(app: Hono, db: Database, client: GitHub
 
     c.header(
       'Set-Cookie',
-      `zenvora_session=${sessionId}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${twelveHoursMs / 1000}`
+      `zenvora_session=${sessionId}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${twelveHoursMs / 1000}`
     );
     return c.redirect('/');
   });
 }
 ```
+
+`SameSite=Strict` rather than `Lax`: this is a single-operator tool with no legitimate cross-site entry point, so there's no login flow `Strict` would break, and it's strictly better CSRF protection than `Lax`.
 
 - [ ] **Step 4: Run it, confirm it passes**
 
@@ -862,7 +879,7 @@ export function createLogoutRoute(app: Hono, db: Database) {
   app.post('/auth/logout', (c) => {
     const sessionId = parseCookie(c.req.header('cookie'), 'zenvora_session');
     if (sessionId) db.query('DELETE FROM sessions WHERE id = ?').run(sessionId);
-    c.header('Set-Cookie', 'zenvora_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0');
+    c.header('Set-Cookie', 'zenvora_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0');
     return c.text('logged out');
   });
 }
@@ -1050,7 +1067,7 @@ git commit -m "feat: add SQLite-backed GitHub response cache and Octokit factory
 
 **Interfaces:**
 - Consumes: `cachedFetch` (Task 7).
-- Produces: `RepoSummary`, `fetchRepoGrid(octokit): Promise<RepoSummary[]>`, `createReposRoute(app, db, octokitFor, repos)` — mounted at `/api/repos` by Task 19.
+- Produces: `RepoSummary`, `fetchRepoGrid(octokit, repos): Promise<RepoSummary[]>`, `createReposRoute(app, db, octokitFor, repos)` — mounted at `/repos` (Task 19 mounts this sub-app under `/api`, giving `/api/repos` — routes here use paths *relative to that mount*, not the full `/api/...` path, otherwise Task 19's `app.route('/api', api)` would double the prefix).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1064,31 +1081,36 @@ import { createReposRoute } from '../../src/github/repos';
 function fakeOctokit() {
   return {
     repos: {
-      listForAuthenticatedUser: async () => ({
-        data: [{ name: 'homelab-infra', full_name: 'qclawchang/homelab-infra', private: false, pushed_at: '2026-08-16T10:47:14Z', language: 'Shell', description: null }],
-      }),
-      listForOrg: async () => ({
-        data: [{ name: 'day-and-you', full_name: 'ZenvoraAI/day-and-you', private: true, pushed_at: '2026-08-16T10:48:16Z', language: 'TypeScript', description: null }],
-      }),
+      get: async ({ owner, repo }: { owner: string; repo: string }) => {
+        const fixtures: Record<string, any> = {
+          'qclawchang/homelab-infra': { name: 'homelab-infra', full_name: 'qclawchang/homelab-infra', private: false, pushed_at: '2026-08-16T10:47:14Z', language: 'Shell', description: null },
+          'ZenvoraAI/day-and-you': { name: 'day-and-you', full_name: 'ZenvoraAI/day-and-you', private: true, pushed_at: '2026-08-16T10:48:16Z', language: 'TypeScript', description: null },
+        };
+        return { data: fixtures[`${owner}/${repo}`] };
+      },
     },
   };
 }
 
-describe('GET /api/repos', () => {
-  test('returns the combined personal + org repo grid', async () => {
+describe('GET /repos', () => {
+  test('returns exactly the passed-in repos, not the operator\'s full account', async () => {
     const db = openDb(':memory:');
     const app = new Hono();
     app.use('*', async (c, next) => { c.set('githubToken', 'ghu_x'); c.set('userId', 4242); await next(); });
-    createReposRoute(app, db, () => fakeOctokit() as any, []);
+    createReposRoute(app, db, () => fakeOctokit() as any, [
+      { owner: 'qclawchang', repo: 'homelab-infra' },
+      { owner: 'ZenvoraAI', repo: 'day-and-you' },
+    ]);
 
-    const res = await app.request('/api/repos');
+    const res = await app.request('/repos');
     const body = await res.json();
 
     expect(res.status).toBe(200);
-    expect(body.map((r: any) => r.fullName)).toEqual([
+    expect(body.data.map((r: any) => r.fullName)).toEqual([
       'qclawchang/homelab-infra',
       'ZenvoraAI/day-and-you',
     ]);
+    expect(body.stale).toBe(false);
     db.close();
   });
 });
@@ -1116,13 +1138,10 @@ export interface RepoSummary {
   description: string | null;
 }
 
-export async function fetchRepoGrid(octokit: Octokit): Promise<RepoSummary[]> {
-  const [{ data: userRepos }, { data: orgRepos }] = await Promise.all([
-    octokit.repos.listForAuthenticatedUser({ affiliation: 'owner', per_page: 100 }),
-    octokit.repos.listForOrg({ org: 'ZenvoraAI', per_page: 100 }),
-  ]);
+export async function fetchRepoGrid(octokit: Octokit, repos: { owner: string; repo: string }[]): Promise<RepoSummary[]> {
+  const results = await Promise.all(repos.map(({ owner, repo }) => octokit.repos.get({ owner, repo })));
 
-  return [...userRepos, ...orgRepos].map((repo: any) => ({
+  return results.map(({ data: repo }: any) => ({
     name: repo.name,
     fullName: repo.full_name,
     private: repo.private,
@@ -1136,15 +1155,17 @@ export function createReposRoute(
   app: Hono,
   db: Database,
   octokitFor: (token: string) => Octokit,
-  _repos: { owner: string; repo: string }[]
+  repos: { owner: string; repo: string }[]
 ) {
-  app.get('/api/repos', async (c) => {
+  app.get('/repos', async (c) => {
     const octokit = octokitFor(c.get('githubToken') as string);
-    const result = await cachedFetch(db, `repos:${c.get('userId')}`, () => fetchRepoGrid(octokit));
-    return c.json(result.data);
+    const result = await cachedFetch(db, `repos:${c.get('userId')}`, () => fetchRepoGrid(octokit, repos));
+    return c.json({ data: result.data, stale: result.stale });
   });
 }
 ```
+
+Fetching each of the 6 repos explicitly via `repos.get` (rather than listing everything the operator owns/belongs to) keeps this panel scoped to exactly the fixed repo set the rest of the plan uses — the previous draft ignored its own `repos` parameter and would have silently listed the operator's entire account.
 
 - [ ] **Step 4: Run it, confirm it passes**
 
@@ -1168,7 +1189,7 @@ git commit -m "feat: add repo grid endpoint"
 
 **Interfaces:**
 - Consumes: `cachedFetch` (Task 7).
-- Produces: `RepoCiStatus`, `CiHealth`, `fetchCiHealth(octokit, repos)`, `createCiRoute(app, db, octokitFor, repos)` — mounted at `/api/ci` by Task 19.
+- Produces: `RepoCiStatus`, `CiHealth`, `fetchCiHealth(octokit, repos)`, `createCiRoute(app, db, octokitFor, repos)` — mounted at `/ci` (becomes `/api/ci` once Task 19 mounts this sub-app under `/api` — see Task 8's note on relative paths).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1186,13 +1207,16 @@ function fakeOctokit(runsByRepo: Record<string, any>) {
         data: { workflow_runs: runsByRepo[`${owner}/${repo}`] ?? [] },
       }),
     },
-    billing: {
-      getGithubActionsBillingOrg: async () => ({ data: { total_minutes_used: 1700, included_minutes: 2000 } }),
+    request: async (route: string) => {
+      if (route === 'GET /organizations/{org}/settings/billing/usage') {
+        return { data: { usageItems: [{ product: 'actions', unitType: 'Minutes', quantity: 1700 }] }, includedMinutes: 2000 } as any;
+      }
+      throw new Error(`unexpected request: ${route}`);
     },
   };
 }
 
-describe('GET /api/ci', () => {
+describe('GET /ci', () => {
   test('reports latest run status per repo and flags quota warning past 80%', async () => {
     const db = openDb(':memory:');
     const octokit = fakeOctokit({
@@ -1207,11 +1231,11 @@ describe('GET /api/ci', () => {
       { owner: 'qclawchang', repo: 'homelab-infra' },
     ]);
 
-    const res = await app.request('/api/ci');
+    const res = await app.request('/ci');
     const body = await res.json();
 
-    expect(body.repos.find((r: any) => r.repo === 'ZenvoraAI/day-and-you').conclusion).toBe('failure');
-    expect(body.quotaWarning).toBe(true);
+    expect(body.data.repos.find((r: any) => r.repo === 'ZenvoraAI/day-and-you').conclusion).toBe('failure');
+    expect(body.data.quotaWarning).toBe(true);
     db.close();
   });
 });
@@ -1260,13 +1284,28 @@ export async function fetchCiHealth(octokit: Octokit, repos: { owner: string; re
     })
   );
 
-  const { data: billing } = await octokit.billing.getGithubActionsBillingOrg({ org: 'ZenvoraAI' });
+  // GitHub's old `GET /orgs/{org}/settings/billing/actions` (the typed
+  // `octokit.billing.getGithubActionsBillingOrg` helper) now returns 410 Gone —
+  // it was replaced by the "enhanced billing" usage API. Using the untyped
+  // `.request()` escape hatch here since there may not be a typed Octokit
+  // helper for the new endpoint yet. VERIFY THE RESPONSE SHAPE against a real
+  // API call early in implementation — the `usageItems` filter/summation below
+  // is a best-effort reading of GitHub's documented shape, not independently
+  // confirmed, and `actionsMinutesUsed`/`actionsMinutesIncluded` may need
+  // adjusting once checked against a real response.
+  const billingResponse = (await octokit.request('GET /organizations/{org}/settings/billing/usage', {
+    org: 'ZenvoraAI',
+  })) as any;
+  const actionsMinutesUsed = (billingResponse.data.usageItems ?? [])
+    .filter((item: any) => item.product === 'actions' && item.unitType === 'Minutes')
+    .reduce((sum: number, item: any) => sum + item.quantity, 0);
+  const actionsMinutesIncluded = billingResponse.includedMinutes ?? 2000;
 
   return {
     repos: runs,
-    actionsMinutesUsed: billing.total_minutes_used,
-    actionsMinutesIncluded: billing.included_minutes,
-    quotaWarning: billing.total_minutes_used >= billing.included_minutes * QUOTA_WARNING_RATIO,
+    actionsMinutesUsed,
+    actionsMinutesIncluded,
+    quotaWarning: actionsMinutesUsed >= actionsMinutesIncluded * QUOTA_WARNING_RATIO,
   };
 }
 
@@ -1276,10 +1315,10 @@ export function createCiRoute(
   octokitFor: (token: string) => Octokit,
   repos: { owner: string; repo: string }[]
 ) {
-  app.get('/api/ci', async (c) => {
+  app.get('/ci', async (c) => {
     const octokit = octokitFor(c.get('githubToken') as string);
     const result = await cachedFetch(db, 'ci-health', () => fetchCiHealth(octokit, repos));
-    return c.json(result.data);
+    return c.json({ data: result.data, stale: result.stale });
   });
 }
 ```
@@ -1306,7 +1345,7 @@ git commit -m "feat: add CI health endpoint with Actions quota warning"
 
 **Interfaces:**
 - Consumes: `cachedFetch` (Task 7).
-- Produces: `RepoSecurityStatus`, `SecurityPosture`, `fetchSecurityPosture(octokit, repos)`, `createSecurityRoute(app, db, octokitFor, repos)` — mounted at `/api/security` by Task 19.
+- Produces: `RepoSecurityStatus`, `SecurityPosture`, `fetchSecurityPosture(octokit, repos)`, `fetchRepoSecurityStatus(octokit, owner, repo)` (single-repo helper, factored out so Task 19's alert checks can reuse it without duplicating the Octokit calls), `createSecurityRoute(app, db, octokitFor, repos)` — mounted at `/security` (becomes `/api/security` once Task 19 mounts this sub-app under `/api`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1329,18 +1368,18 @@ function fakeOctokit() {
   };
 }
 
-describe('GET /api/security', () => {
+describe('GET /security', () => {
   test('reports 2FA status, alert counts, and marks unsupported checks unavailable-on-plan', async () => {
     const db = openDb(':memory:');
     const app = new Hono();
     app.use('*', async (c, next) => { c.set('githubToken', 'ghu_x'); await next(); });
     createSecurityRoute(app, db, () => fakeOctokit() as any, [{ owner: 'ZenvoraAI', repo: 'day-and-you' }]);
 
-    const res = await app.request('/api/security');
+    const res = await app.request('/security');
     const body = await res.json();
 
-    expect(body.twoFactorEnabled).toBe(true);
-    expect(body.repos[0]).toEqual({
+    expect(body.data.twoFactorEnabled).toBe(true);
+    expect(body.data.repos[0]).toEqual({
       repo: 'ZenvoraAI/day-and-you',
       openDependabotAlerts: 1,
       secretsCount: 3,
@@ -1378,6 +1417,20 @@ export interface SecurityPosture {
   repos: RepoSecurityStatus[];
 }
 
+export async function fetchRepoSecurityStatus(octokit: Octokit, owner: string, repo: string): Promise<RepoSecurityStatus> {
+  const [alerts, secrets] = await Promise.all([
+    octokit.dependabot.listAlertsForRepo({ owner, repo, state: 'open', per_page: 100 }),
+    octokit.actions.listRepoSecrets({ owner, repo, per_page: 1 }),
+  ]);
+  return {
+    repo: `${owner}/${repo}`,
+    openDependabotAlerts: alerts.data.length,
+    secretsCount: secrets.data.total_count,
+    branchProtection: 'unavailable_on_plan' as const,
+    secretScanning: 'unavailable_on_plan' as const,
+  };
+}
+
 export async function fetchSecurityPosture(
   octokit: Octokit,
   repos: { owner: string; repo: string }[]
@@ -1385,19 +1438,7 @@ export async function fetchSecurityPosture(
   const { data: user } = await octokit.users.getAuthenticated();
 
   const repoStatuses = await Promise.all(
-    repos.map(async ({ owner, repo }) => {
-      const [alerts, secrets] = await Promise.all([
-        octokit.dependabot.listAlertsForRepo({ owner, repo, state: 'open', per_page: 100 }),
-        octokit.actions.listRepoSecrets({ owner, repo, per_page: 1 }),
-      ]);
-      return {
-        repo: `${owner}/${repo}`,
-        openDependabotAlerts: alerts.data.length,
-        secretsCount: secrets.data.total_count,
-        branchProtection: 'unavailable_on_plan' as const,
-        secretScanning: 'unavailable_on_plan' as const,
-      };
-    })
+    repos.map(({ owner, repo }) => fetchRepoSecurityStatus(octokit, owner, repo))
   );
 
   return {
@@ -1412,10 +1453,10 @@ export function createSecurityRoute(
   octokitFor: (token: string) => Octokit,
   repos: { owner: string; repo: string }[]
 ) {
-  app.get('/api/security', async (c) => {
+  app.get('/security', async (c) => {
     const octokit = octokitFor(c.get('githubToken') as string);
     const result = await cachedFetch(db, 'security-posture', () => fetchSecurityPosture(octokit, repos));
-    return c.json(result.data);
+    return c.json({ data: result.data, stale: result.stale });
   });
 }
 ```
@@ -1442,7 +1483,7 @@ git commit -m "feat: add security posture endpoint with plan-unavailable handlin
 
 **Interfaces:**
 - Consumes: `cachedFetch` (Task 7).
-- Produces: `BacklogItem`, `Backlog`, `fetchBacklog(octokit, username, repos)`, `createBacklogRoute(app, db, octokitFor, username, repos)` — mounted at `/api/backlog` by Task 19.
+- Produces: `BacklogItem`, `Backlog`, `fetchBacklog(octokit, username, repos)`, `createBacklogRoute(app, db, octokitFor, username, repos)` — mounted at `/backlog` (becomes `/api/backlog` once Task 19 mounts this sub-app under `/api`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1472,19 +1513,19 @@ function fakeOctokit() {
   };
 }
 
-describe('GET /api/backlog', () => {
+describe('GET /backlog', () => {
   test('aggregates review-requested PRs, assigned issues, and stale branches', async () => {
     const db = openDb(':memory:');
     const app = new Hono();
     app.use('*', async (c, next) => { c.set('githubToken', 'ghu_x'); await next(); });
     createBacklogRoute(app, db, () => fakeOctokit() as any, 'qclawchang', [{ owner: 'ZenvoraAI', repo: 'day-and-you' }]);
 
-    const res = await app.request('/api/backlog');
+    const res = await app.request('/backlog');
     const body = await res.json();
 
-    expect(body.reviewRequestedPrs).toHaveLength(1);
-    expect(body.assignedIssues).toHaveLength(1);
-    expect(body.staleBranches).toEqual([{ repo: 'ZenvoraAI/day-and-you', branch: 'old-feature', lastCommitAt: expect.any(String) }]);
+    expect(body.data.reviewRequestedPrs).toHaveLength(1);
+    expect(body.data.assignedIssues).toHaveLength(1);
+    expect(body.data.staleBranches).toEqual([{ repo: 'ZenvoraAI/day-and-you', branch: 'old-feature', lastCommitAt: expect.any(String) }]);
     db.close();
   });
 });
@@ -1538,23 +1579,28 @@ export async function fetchBacklog(
   ]);
 
   const staleCutoff = Date.now() - STALE_BRANCH_DAYS * 24 * 60 * 60 * 1000;
-  const staleBranches: Backlog['staleBranches'] = [];
 
-  for (const { owner, repo } of repos) {
-    const { data: branches } = await octokit.repos.listBranches({ owner, repo, per_page: 100 });
-    for (const branch of branches) {
-      const { data: commit } = await octokit.repos.getCommit({ owner, repo, ref: branch.commit.sha });
-      const commitDate = commit.commit.committer?.date;
-      if (commitDate && new Date(commitDate).getTime() < staleCutoff) {
-        staleBranches.push({ repo: `${owner}/${repo}`, branch: branch.name, lastCommitAt: commitDate });
-      }
-    }
-  }
+  const staleBranchesByRepo = await Promise.all(
+    repos.map(async ({ owner, repo }) => {
+      const { data: branches } = await octokit.repos.listBranches({ owner, repo, per_page: 100 });
+      const checked = await Promise.all(
+        branches.map(async (branch) => {
+          const { data: commit } = await octokit.repos.getCommit({ owner, repo, ref: branch.commit.sha });
+          const commitDate = commit.commit.committer?.date;
+          if (commitDate && new Date(commitDate).getTime() < staleCutoff) {
+            return { repo: `${owner}/${repo}`, branch: branch.name, lastCommitAt: commitDate };
+          }
+          return null;
+        })
+      );
+      return checked.filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+    })
+  );
 
   return {
     reviewRequestedPrs: prSearch.data.items.map(toItem),
     assignedIssues: issueSearch.data.items.map(toItem),
-    staleBranches,
+    staleBranches: staleBranchesByRepo.flat(),
   };
 }
 
@@ -1565,10 +1611,10 @@ export function createBacklogRoute(
   username: string,
   repos: { owner: string; repo: string }[]
 ) {
-  app.get('/api/backlog', async (c) => {
+  app.get('/backlog', async (c) => {
     const octokit = octokitFor(c.get('githubToken') as string);
     const result = await cachedFetch(db, 'backlog', () => fetchBacklog(octokit, username, repos));
-    return c.json(result.data);
+    return c.json({ data: result.data, stale: result.stale });
   });
 }
 ```
@@ -1594,7 +1640,7 @@ git commit -m "feat: add backlog endpoint (PRs, issues, stale branches)"
 - Test: `tests/deployment/dockerProxy.test.ts`
 
 **Interfaces:**
-- Produces: `RunningContainer { name, image, imageDigest }`, `listRunningContainers(proxyBaseUrl?): Promise<RunningContainer[]>` — consumed by Task 14.
+- Produces: `RunningContainer { name, image, imageTag }`, `listRunningContainers(proxyBaseUrl?): Promise<RunningContainer[]>` — consumed by Task 14. `imageTag` is parsed out of the container's `Image` reference string (e.g. `ghcr.io/zenvoraai/family-media-api:abc123` → `abc123`), not a content digest — see Task 13 for why: this repo's services are pinned by SHA-as-tag (immutable per build), not by manifest digest, and 2 of the 6 don't have a pin mechanism at all.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1607,11 +1653,11 @@ const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
 
 describe('listRunningContainers', () => {
-  test('maps the docker-socket-proxy response into RunningContainer records', async () => {
+  test('maps the docker-socket-proxy response into RunningContainer records, extracting the tag', async () => {
     globalThis.fetch = mock(async () =>
       new Response(
         JSON.stringify([
-          { Names: ['/homelab-family-api'], Image: 'ghcr.io/zenvoraai/family-media-api:abc123', ImageID: 'sha256:deadbeef' },
+          { Names: ['/homelab-family-api'], Image: 'ghcr.io/zenvoraai/family-media-api:abc123' },
         ]),
         { status: 200 }
       )
@@ -1620,7 +1666,22 @@ describe('listRunningContainers', () => {
     const result = await listRunningContainers('http://fake-proxy:2375');
 
     expect(result).toEqual([
-      { name: 'homelab-family-api', image: 'ghcr.io/zenvoraai/family-media-api:abc123', imageDigest: 'sha256:deadbeef' },
+      { name: 'homelab-family-api', image: 'ghcr.io/zenvoraai/family-media-api:abc123', imageTag: 'abc123' },
+    ]);
+  });
+
+  test('defaults the tag to "latest" when the image reference has none', async () => {
+    globalThis.fetch = mock(async () =>
+      new Response(
+        JSON.stringify([{ Names: ['/homelab-memorial-api'], Image: 'ghcr.io/zenvoraai/aiqiuqi-memorial-api' }]),
+        { status: 200 }
+      )
+    ) as any;
+
+    const result = await listRunningContainers('http://fake-proxy:2375');
+
+    expect(result).toEqual([
+      { name: 'homelab-memorial-api', image: 'ghcr.io/zenvoraai/aiqiuqi-memorial-api', imageTag: 'latest' },
     ]);
   });
 
@@ -1642,7 +1703,16 @@ Expected: FAIL — module not found.
 export interface RunningContainer {
   name: string;
   image: string;
-  imageDigest: string | null;
+  imageTag: string;
+}
+
+function parseImageTag(image: string): string {
+  const colonIndex = image.lastIndexOf(':');
+  const slashIndex = image.lastIndexOf('/');
+  // a colon only counts as a tag separator if it comes after the last slash —
+  // otherwise it's part of a registry host:port, e.g. "localhost:5000/name"
+  const hasTag = colonIndex > slashIndex;
+  return hasTag ? image.slice(colonIndex + 1) : 'latest';
 }
 
 export async function listRunningContainers(
@@ -1651,12 +1721,12 @@ export async function listRunningContainers(
   const res = await fetch(`${proxyBaseUrl}/containers/json`);
   if (!res.ok) throw new Error(`docker-socket-proxy returned ${res.status}`);
 
-  const containers = (await res.json()) as Array<{ Names: string[]; Image: string; ImageID: string }>;
+  const containers = (await res.json()) as Array<{ Names: string[]; Image: string }>;
 
   return containers.map((c) => ({
     name: c.Names[0]?.replace(/^\//, '') ?? 'unknown',
     image: c.Image,
-    imageDigest: c.ImageID.startsWith('sha256:') ? c.ImageID : null,
+    imageTag: parseImageTag(c.Image),
   }));
 }
 ```
@@ -1675,14 +1745,16 @@ git commit -m "feat: add docker-socket-proxy client for reading container state"
 
 ---
 
-### Task 13: GHCR digest comparison (drift signals)
+### Task 13: GHCR tag comparison (drift signals)
 
 **Files:**
 - Create: `src/deployment/drift.ts`
 - Test: `tests/deployment/drift.test.ts`
 
 **Interfaces:**
-- Produces: `PinnedContainer { name, ghcrPackage, pinnedDigest }`, `GhcrVersion { digest, createdAt }`, `DriftSignal` (discriminated union: `ok` | `fault` | `upgrade_available`), `compareDrift(pinned, runningDigest, latestGhcrVersion): DriftSignal`, `fetchLatestGhcrVersion(octokit, packageName): Promise<GhcrVersion | null>` — both consumed by Task 14.
+- Produces: `PinnedContainer { name, ghcrPackage, pinnedTag }`, `GhcrVersion { tag, createdAt }`, `DriftSignal` (discriminated union: `ok` | `fault` | `upgrade_available`), `compareDrift(pinned, runningTag, latestGhcrVersion): DriftSignal`, `fetchLatestGhcrVersion(octokit, packageName): Promise<GhcrVersion | null>` — both consumed by Task 14.
+
+This compares **tags**, not content digests. `family-api`, `securevault-api`, `memorial-api`, and `memorial-worker` are pinned in `docker-compose.yml` via a tag env var (`${FAMILY_API_TAG:-latest}` etc.) whose value is a commit SHA — the SHA *is* the tag, immutable per build, not a separate `sha256:` manifest digest. `dayandyou-staging` and `dayandyou-prod` use static `:staging`/`:release` tags with **no** per-deploy pin override in `docker-compose.yml` at all — for those two, `pinnedTag` is `null`, and `compareDrift` must never report `fault` for them (there is nothing to have drifted from), only `ok`/`upgrade_available`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1692,28 +1764,55 @@ import { describe, test, expect } from 'bun:test';
 import { compareDrift, fetchLatestGhcrVersion } from '../../src/deployment/drift';
 
 describe('compareDrift', () => {
-  const pinned = { name: 'family-api', ghcrPackage: 'family-media-api', pinnedDigest: 'sha256:aaa' };
+  const pinned = { name: 'family-api', ghcrPackage: 'family-media-api', pinnedTag: 'abc123' };
 
-  test('flags a fault when the running digest does not match the pin', () => {
-    const signal = compareDrift(pinned, 'sha256:bbb', { digest: 'sha256:aaa', createdAt: '2026-08-16T00:00:00Z' });
-    expect(signal).toEqual({ kind: 'fault', runningDigest: 'sha256:bbb', pinnedDigest: 'sha256:aaa' });
+  test('flags a fault when the running tag does not match the pin', () => {
+    const signal = compareDrift(pinned, 'oldtag', { tag: 'abc123', createdAt: '2026-08-16T00:00:00Z' });
+    expect(signal).toEqual({ kind: 'fault', runningTag: 'oldtag', pinnedTag: 'abc123' });
   });
 
   test('flags upgrade-available when the pin is correct but GHCR has something newer', () => {
-    const signal = compareDrift(pinned, 'sha256:aaa', { digest: 'sha256:ccc', createdAt: '2026-08-16T00:00:00Z' });
-    expect(signal).toEqual({ kind: 'upgrade_available', pinnedDigest: 'sha256:aaa', latestDigest: 'sha256:ccc' });
+    const signal = compareDrift(pinned, 'abc123', { tag: 'def456', createdAt: '2026-08-16T00:00:00Z' });
+    expect(signal).toEqual({ kind: 'upgrade_available', pinnedTag: 'abc123', latestTag: 'def456' });
   });
 
-  test('reports ok when the running digest matches the pin and nothing newer exists', () => {
-    const signal = compareDrift(pinned, 'sha256:aaa', { digest: 'sha256:aaa', createdAt: '2026-08-16T00:00:00Z' });
+  test('reports ok when the running tag matches the pin and nothing newer exists', () => {
+    const signal = compareDrift(pinned, 'abc123', { tag: 'abc123', createdAt: '2026-08-16T00:00:00Z' });
     expect(signal).toEqual({ kind: 'ok' });
+  });
+
+  test('never reports a fault for a container with no pin mechanism (e.g. dayandyou)', () => {
+    const unpinned = { name: 'dayandyou-staging', ghcrPackage: 'dayandyou', pinnedTag: null };
+
+    const matching = compareDrift(unpinned, 'staging', { tag: 'staging', createdAt: '2026-08-16T00:00:00Z' });
+    expect(matching).toEqual({ kind: 'ok' });
+
+    const withUpgrade = compareDrift(unpinned, 'staging-old', { tag: 'staging-new', createdAt: '2026-08-16T00:00:00Z' });
+    expect(withUpgrade.kind).toBe('upgrade_available');
   });
 });
 
 describe('fetchLatestGhcrVersion', () => {
-  test('returns the most recently created version', async () => {
-    const octokit = { packages: { getAllPackageVersionsForPackageOwnedByOrg: async () => ({ data: [{ name: 'sha256:aaa', created_at: '2026-08-16T00:00:00Z' }] }) } };
-    expect(await fetchLatestGhcrVersion(octokit as any, 'family-media-api')).toEqual({ digest: 'sha256:aaa', createdAt: '2026-08-16T00:00:00Z' });
+  test('returns the most recently created version and its tag', async () => {
+    const octokit = {
+      packages: {
+        getAllPackageVersionsForPackageOwnedByOrg: async () => ({
+          data: [{ metadata: { container: { tags: ['abc123'] } }, created_at: '2026-08-16T00:00:00Z' }],
+        }),
+      },
+    };
+    expect(await fetchLatestGhcrVersion(octokit as any, 'family-media-api')).toEqual({ tag: 'abc123', createdAt: '2026-08-16T00:00:00Z' });
+  });
+
+  test('returns a null tag when the version has no tags (untagged/dangling)', async () => {
+    const octokit = {
+      packages: {
+        getAllPackageVersionsForPackageOwnedByOrg: async () => ({
+          data: [{ metadata: { container: { tags: [] } }, created_at: '2026-08-16T00:00:00Z' }],
+        }),
+      },
+    };
+    expect(await fetchLatestGhcrVersion(octokit as any, 'family-media-api')).toEqual({ tag: null, createdAt: '2026-08-16T00:00:00Z' });
   });
 
   test('returns null when the package has no versions', async () => {
@@ -1736,29 +1835,30 @@ import type { Octokit } from '@octokit/rest';
 export interface PinnedContainer {
   name: string;
   ghcrPackage: string;
-  pinnedDigest: string;
+  /** null for containers with no per-deploy pin mechanism (dayandyou-staging/-prod) */
+  pinnedTag: string | null;
 }
 
 export interface GhcrVersion {
-  digest: string;
+  tag: string | null;
   createdAt: string;
 }
 
 export type DriftSignal =
   | { kind: 'ok' }
-  | { kind: 'fault'; runningDigest: string | null; pinnedDigest: string }
-  | { kind: 'upgrade_available'; pinnedDigest: string; latestDigest: string };
+  | { kind: 'fault'; runningTag: string; pinnedTag: string }
+  | { kind: 'upgrade_available'; pinnedTag: string | null; latestTag: string };
 
 export function compareDrift(
   pinned: PinnedContainer,
-  runningDigest: string | null,
+  runningTag: string,
   latestGhcrVersion: GhcrVersion | null
 ): DriftSignal {
-  if (runningDigest !== pinned.pinnedDigest) {
-    return { kind: 'fault', runningDigest, pinnedDigest: pinned.pinnedDigest };
+  if (pinned.pinnedTag !== null && runningTag !== pinned.pinnedTag) {
+    return { kind: 'fault', runningTag, pinnedTag: pinned.pinnedTag };
   }
-  if (latestGhcrVersion && latestGhcrVersion.digest !== pinned.pinnedDigest) {
-    return { kind: 'upgrade_available', pinnedDigest: pinned.pinnedDigest, latestDigest: latestGhcrVersion.digest };
+  if (latestGhcrVersion?.tag && latestGhcrVersion.tag !== runningTag) {
+    return { kind: 'upgrade_available', pinnedTag: pinned.pinnedTag, latestTag: latestGhcrVersion.tag };
   }
   return { kind: 'ok' };
 }
@@ -1771,9 +1871,14 @@ export async function fetchLatestGhcrVersion(octokit: Octokit, packageName: stri
     per_page: 1,
   });
 
-  const latest = versions[0];
+  const latest = versions[0] as any;
   if (!latest) return null;
-  return { digest: latest.name, createdAt: latest.created_at };
+  // A container package version's tags live at `metadata.container.tags` per
+  // GitHub's documented package-version shape — VERIFY THIS against a real API
+  // call early in implementation (Task 21's GitHub App setup step is a natural
+  // point to do this), since it wasn't independently confirmed during review.
+  const tag: string | null = latest.metadata?.container?.tags?.[0] ?? null;
+  return { tag, createdAt: latest.created_at };
 }
 ```
 
@@ -1799,7 +1904,7 @@ git commit -m "feat: add drift comparison logic (fault vs upgrade-available sign
 
 **Interfaces:**
 - Consumes: `listRunningContainers` (Task 12), `compareDrift`/`fetchLatestGhcrVersion`/`PinnedContainer` (Task 13), `cachedFetch` (Task 7).
-- Produces: `fetchDeploymentDrift(octokit, pinned)`, `createDeploymentRoute(app, db, octokitFor, pinned)` — mounted at `/api/deployment` by Task 19.
+- Produces: `fetchDeploymentDrift(octokit, pinned)`, `createDeploymentRoute(app, db, octokitFor, pinned)` — mounted at `/deployment` (becomes `/api/deployment` once Task 19 mounts this sub-app under `/api`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1809,7 +1914,7 @@ import { describe, test, expect, mock } from 'bun:test';
 
 mock.module('../../src/deployment/dockerProxy', () => ({
   listRunningContainers: async () => [
-    { name: 'homelab-family-api', image: 'ghcr.io/zenvoraai/family-media-api:abc', imageDigest: 'sha256:aaa' },
+    { name: 'homelab-family-api', image: 'ghcr.io/zenvoraai/family-media-api:abc123', imageTag: 'abc123' },
   ],
 }));
 
@@ -1817,25 +1922,50 @@ const { Hono } = await import('hono');
 const { openDb } = await import('../../src/db/client');
 const { createDeploymentRoute } = await import('../../src/deployment/route');
 
-describe('GET /api/deployment', () => {
+describe('GET /deployment', () => {
   test('reports a container matching its pin as ok', async () => {
     const db = openDb(':memory:');
     const octokit = {
       packages: {
-        getAllPackageVersionsForPackageOwnedByOrg: async () => ({ data: [{ name: 'sha256:aaa', created_at: '2026-08-16T00:00:00Z' }] }),
+        getAllPackageVersionsForPackageOwnedByOrg: async () => ({
+          data: [{ metadata: { container: { tags: ['abc123'] } }, created_at: '2026-08-16T00:00:00Z' }],
+        }),
       },
     };
 
     const app = new Hono();
     app.use('*', async (c, next) => { c.set('githubToken', 'ghu_x'); await next(); });
     createDeploymentRoute(app, db, () => octokit as any, [
-      { name: 'homelab-family-api', ghcrPackage: 'family-media-api', pinnedDigest: 'sha256:aaa' },
+      { name: 'homelab-family-api', ghcrPackage: 'family-media-api', pinnedTag: 'abc123' },
     ]);
 
-    const res = await app.request('/api/deployment');
+    const res = await app.request('/deployment');
     const body = await res.json();
 
-    expect(body).toEqual([{ container: 'homelab-family-api', signal: { kind: 'ok' } }]);
+    expect(body.data).toEqual([{ container: 'homelab-family-api', signal: { kind: 'ok' } }]);
+    db.close();
+  });
+
+  test('reports a container with no pin mechanism (dayandyou) as ok when tags match, never as a fault', async () => {
+    const db = openDb(':memory:');
+    const octokit = {
+      packages: {
+        getAllPackageVersionsForPackageOwnedByOrg: async () => ({
+          data: [{ metadata: { container: { tags: ['staging'] } }, created_at: '2026-08-16T00:00:00Z' }],
+        }),
+      },
+    };
+
+    const app = new Hono();
+    app.use('*', async (c, next) => { c.set('githubToken', 'ghu_x'); await next(); });
+    createDeploymentRoute(app, db, () => octokit as any, [
+      { name: 'homelab-family-api', ghcrPackage: 'dayandyou', pinnedTag: null },
+    ]);
+
+    const res = await app.request('/deployment');
+    const body = await res.json();
+
+    expect(body.data[0].signal.kind).not.toBe('fault');
     db.close();
   });
 });
@@ -1863,7 +1993,10 @@ export async function fetchDeploymentDrift(octokit: Octokit, pinned: PinnedConta
     pinned.map(async (p) => {
       const runningContainer = running.find((r) => r.name === p.name);
       const latest = await fetchLatestGhcrVersion(octokit, p.ghcrPackage);
-      const signal = compareDrift(p, runningContainer?.imageDigest ?? null, latest);
+      // a container that isn't running at all has no real tag to compare — 'unknown'
+      // guarantees a fault for pinned services (correct: it's not running what it
+      // should be) and just an informational upgrade_available for unpinned ones
+      const signal = compareDrift(p, runningContainer?.imageTag ?? 'unknown', latest);
       return { container: p.name, signal };
     })
   );
@@ -1875,10 +2008,10 @@ export function createDeploymentRoute(
   octokitFor: (token: string) => Octokit,
   pinned: PinnedContainer[]
 ) {
-  app.get('/api/deployment', async (c) => {
+  app.get('/deployment', async (c) => {
     const octokit = octokitFor(c.get('githubToken') as string);
     const result = await cachedFetch(db, 'deployment-drift', () => fetchDeploymentDrift(octokit, pinned));
-    return c.json(result.data);
+    return c.json({ data: result.data, stale: result.stale });
   });
 }
 ```
@@ -2024,6 +2157,23 @@ describe('runAlertChecks', () => {
     expect(notify).toHaveBeenCalledTimes(1);
     db.close();
   });
+
+  test("one check's evaluate() throwing does not prevent the next check from running", async () => {
+    const db = openDb(':memory:');
+    const notify = mock(async () => {});
+    const failingCheck = {
+      key: 'ci:broken-repo',
+      describe: 'CI for broken-repo',
+      evaluate: async () => { throw new Error('GitHub API unreachable'); },
+    };
+    const healthyCheck = { key: 'ci:day-and-you', describe: 'CI for day-and-you', evaluate: async () => 'bad' as const };
+
+    await runAlertChecks(db, [failingCheck, healthyCheck], notify);
+
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].subject).toContain('day-and-you');
+    db.close();
+  });
 });
 ```
 
@@ -2047,13 +2197,20 @@ export interface AlertCheck {
 
 export async function runAlertChecks(db: Database, checks: AlertCheck[], notify = sendAlertEmail) {
   for (const check of checks) {
-    const status = await check.evaluate();
-    const transition = recordCheckAndGetTransition(db, check.key, status);
-    if (transition && transition.to === 'bad') {
-      await notify({
-        subject: `zenvora-admin alert: ${check.describe}`,
-        body: `${check.describe} went from ${transition.from} to bad at ${new Date().toISOString()}.`,
-      });
+    try {
+      const status = await check.evaluate();
+      const transition = recordCheckAndGetTransition(db, check.key, status);
+      if (transition && transition.to === 'bad') {
+        await notify({
+          subject: `zenvora-admin alert: ${check.describe}`,
+          body: `${check.describe} went from ${transition.from} to bad at ${new Date().toISOString()}.`,
+        });
+      }
+    } catch (err) {
+      // one check's failure (e.g. a transient GitHub API error) must never
+      // silence every other check in the same run — that's exactly the
+      // silent-failure mode this whole tool exists to prevent
+      console.error(`alert check "${check.key}" failed`, err);
     }
   }
 }
@@ -2094,16 +2251,20 @@ git commit -m "feat: add proactive alert job (state diff, email, scheduler)"
 // tests/static.test.ts
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { Hono } from 'hono';
 import { mountStaticFrontend } from '../src/static';
 
 describe('mountStaticFrontend', () => {
   let dir: string;
+  let relativeDir: string;
 
   beforeAll(() => {
-    dir = mkdtempSync(join(tmpdir(), 'zenvora-static-'));
+    // hono/bun's serveStatic resolves `root` relative to the process cwd, not
+    // as an absolute path — create the fixture dir under cwd rather than the
+    // OS tmpdir so this test reflects that.
+    dir = mkdtempSync(join(process.cwd(), 'zenvora-static-'));
+    relativeDir = relative(process.cwd(), dir);
     writeFileSync(join(dir, 'index.html'), '<html><body>zenvora-admin</body></html>');
   });
 
@@ -2111,7 +2272,7 @@ describe('mountStaticFrontend', () => {
 
   test('serves index.html at the root path', async () => {
     const app = new Hono();
-    mountStaticFrontend(app, dir);
+    mountStaticFrontend(app, relativeDir);
 
     const res = await app.request('/');
     expect(res.status).toBe(200);
@@ -2379,12 +2540,12 @@ git commit -m "feat: scaffold frontend with API client and design tokens"
 
 **Files:**
 - Create: `frontend/src/hooks/useApiData.ts`
-- Create: `frontend/src/components/RepoGrid.tsx`, `CiHealth.tsx`, `SecurityPosture.tsx`, `DeploymentDrift.tsx`, `Backlog.tsx`
-- Modify: `frontend/src/App.tsx` (render all 5 panels)
+- Create: `frontend/src/components/RepoGrid.tsx`, `CiHealth.tsx`, `SecurityPosture.tsx`, `DeploymentDrift.tsx`, `Backlog.tsx`, `LoginGate.tsx`
+- Modify: `frontend/src/App.tsx` (render `LoginGate` at `/login`, otherwise all 5 panels)
 - Test: `frontend/src/components/__tests__/panels.test.tsx`
 
 **Interfaces:**
-- Consumes: `apiGet`, `ApiError` (Task 17); response shapes from `RepoSummary` (Task 8), `CiHealth` (Task 9), `SecurityPosture` (Task 10), deployment drift rows (Task 14), `Backlog` (Task 11) — kept as inline TS interfaces here rather than importing across the frontend/backend boundary.
+- Consumes: `apiGet`, `ApiError` (Task 17); every backend route now responds `{ data, stale }` (Tasks 8–11, 14, after the stale-surfacing fix), so `useApiData`'s success variant is `{ status: 'success', data: T, stale: boolean }`.
 
 - [ ] **Step 1: Write `frontend/src/hooks/useApiData.ts`**
 
@@ -2395,15 +2556,20 @@ import { apiGet, ApiError } from '../api';
 export type ApiDataState<T> =
   | { status: 'loading' }
   | { status: 'error'; message: string }
-  | { status: 'success'; data: T };
+  | { status: 'success'; data: T; stale: boolean };
+
+interface ApiEnvelope<T> {
+  data: T;
+  stale: boolean;
+}
 
 export function useApiData<T>(path: string): ApiDataState<T> {
   const [state, setState] = useState<ApiDataState<T>>({ status: 'loading' });
 
   useEffect(() => {
     let cancelled = false;
-    apiGet<T>(path)
-      .then((data) => { if (!cancelled) setState({ status: 'success', data }); })
+    apiGet<ApiEnvelope<T>>(path)
+      .then((envelope) => { if (!cancelled) setState({ status: 'success', data: envelope.data, stale: envelope.stale }); })
       .catch((err) => {
         if (cancelled) return;
         setState({ status: 'error', message: err instanceof ApiError ? err.message : 'unexpected error' });
@@ -2429,9 +2595,10 @@ afterEach(() => { globalThis.fetch = originalFetch; });
 
 describe('RepoGrid', () => {
   test('renders repo cards once data loads', async () => {
-    globalThis.fetch = mock(async () => new Response(JSON.stringify([
-      { name: 'homelab-infra', fullName: 'qclawchang/homelab-infra', private: false, pushedAt: null, language: 'Shell', description: null },
-    ]), { status: 200 })) as any;
+    globalThis.fetch = mock(async () => new Response(JSON.stringify({
+      data: [{ name: 'homelab-infra', fullName: 'qclawchang/homelab-infra', private: false, pushedAt: null, language: 'Shell', description: null }],
+      stale: false,
+    }), { status: 200 })) as any;
 
     render(<RepoGrid />);
     await waitFor(() => expect(screen.getByText('homelab-infra')).toBeDefined());
@@ -2442,14 +2609,27 @@ describe('RepoGrid', () => {
     render(<RepoGrid />);
     await waitFor(() => expect(screen.getByText(/couldn't load repos/)).toBeDefined());
   });
+
+  test('shows a stale indicator when the API served a cached value after a live-fetch failure', async () => {
+    globalThis.fetch = mock(async () => new Response(JSON.stringify({
+      data: [{ name: 'homelab-infra', fullName: 'qclawchang/homelab-infra', private: false, pushedAt: null, language: 'Shell', description: null }],
+      stale: true,
+    }), { status: 200 })) as any;
+
+    render(<RepoGrid />);
+    await waitFor(() => expect(screen.getByText(/may be out of date/)).toBeDefined());
+  });
 });
 
 describe('DeploymentDrift', () => {
   test('visually distinguishes a fault from an upgrade-available signal', async () => {
-    globalThis.fetch = mock(async () => new Response(JSON.stringify([
-      { container: 'homelab-family-api', signal: { kind: 'fault', runningDigest: 'sha256:bbb', pinnedDigest: 'sha256:aaa' } },
-      { container: 'homelab-securevault-api', signal: { kind: 'upgrade_available', pinnedDigest: 'sha256:aaa', latestDigest: 'sha256:ccc' } },
-    ]), { status: 200 })) as any;
+    globalThis.fetch = mock(async () => new Response(JSON.stringify({
+      data: [
+        { container: 'homelab-family-api', signal: { kind: 'fault', runningTag: 'oldtag', pinnedTag: 'abc123' } },
+        { container: 'homelab-securevault-api', signal: { kind: 'upgrade_available', pinnedTag: 'abc123', latestTag: 'def456' } },
+      ],
+      stale: false,
+    }), { status: 200 })) as any;
 
     render(<DeploymentDrift />);
     await waitFor(() => expect(screen.getByText(/DRIFT/)).toBeDefined());
@@ -2482,6 +2662,7 @@ export function RepoGrid() {
   return (
     <section>
       <h2>Repos</h2>
+      {state.stale && <p className="status-upgrade">showing cached data, may be out of date</p>}
       <div style={{ display: 'grid', gap: '12px', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))' }}>
         {state.data.map((repo) => (
           <article key={repo.fullName} className="card">
@@ -2516,6 +2697,7 @@ export function CiHealth() {
   return (
     <section>
       <h2>CI health</h2>
+      {state.stale && <p className="status-upgrade">showing cached data, may be out of date</p>}
       {state.data.quotaWarning && (
         <p className="status-fault">Actions minutes at {state.data.actionsMinutesUsed}/{state.data.actionsMinutesIncluded} — over 80% of quota.</p>
       )}
@@ -2550,6 +2732,7 @@ export function SecurityPosture() {
   return (
     <section>
       <h2>Security posture</h2>
+      {state.stale && <p className="status-upgrade">showing cached data, may be out of date</p>}
       <p className={state.data.twoFactorEnabled ? 'status-ok' : 'status-fault'}>
         Account 2FA: {state.data.twoFactorEnabled ? 'enabled' : 'disabled'}
       </p>
@@ -2574,8 +2757,8 @@ import { useApiData } from '../hooks/useApiData';
 
 type DriftSignal =
   | { kind: 'ok' }
-  | { kind: 'fault'; runningDigest: string | null; pinnedDigest: string }
-  | { kind: 'upgrade_available'; pinnedDigest: string; latestDigest: string };
+  | { kind: 'fault'; runningTag: string; pinnedTag: string }
+  | { kind: 'upgrade_available'; pinnedTag: string | null; latestTag: string };
 
 interface DeploymentRow { container: string; signal: DriftSignal; }
 
@@ -2588,6 +2771,7 @@ export function DeploymentDrift() {
   return (
     <section>
       <h2>Deployment drift</h2>
+      {state.stale && <p className="status-upgrade">showing cached data, may be out of date</p>}
       <ul>
         {state.data.map((row) => (
           <li key={row.container} className={row.signal.kind === 'fault' ? 'status-fault' : row.signal.kind === 'upgrade_available' ? 'status-upgrade' : 'status-ok'}>
@@ -2620,6 +2804,7 @@ export function Backlog() {
   return (
     <section>
       <h2>Backlog</h2>
+      {state.stale && <p className="status-upgrade">showing cached data, may be out of date</p>}
       <h3>PRs awaiting review</h3>
       <ul>{state.data.reviewRequestedPrs.map((pr) => <li key={pr.url}><a href={pr.url}>{pr.repo}: {pr.title}</a></li>)}</ul>
       <h3>Assigned issues</h3>
@@ -2631,7 +2816,48 @@ export function Backlog() {
 }
 ```
 
-- [ ] **Step 9: Update `frontend/src/App.tsx` to render all five panels**
+- [ ] **Step 9: Write `frontend/src/components/LoginGate.tsx` and its test** — the spec requires rejection reasons to render on a login page (Task 5's callback now redirects to `/login?error=...` instead of returning a plain-text 403); this is that page.
+
+```tsx
+// frontend/src/components/__tests__/loginGate.test.tsx
+import { describe, test, expect } from 'bun:test';
+import { render, screen } from '@testing-library/react';
+import { LoginGate } from '../LoginGate';
+
+describe('LoginGate', () => {
+  test('shows a login link with no error text when there is no ?error= param', () => {
+    window.history.pushState({}, '', '/login');
+    render(<LoginGate />);
+    expect(screen.getByText(/log in with github/i)).toBeDefined();
+  });
+
+  test('shows the decoded rejection reason when ?error= is present', () => {
+    window.history.pushState({}, '', '/login?error=' + encodeURIComponent('two-factor authentication must be enabled on this GitHub account'));
+    render(<LoginGate />);
+    expect(screen.getByText(/two-factor authentication must be enabled/)).toBeDefined();
+  });
+});
+```
+
+```tsx
+// frontend/src/components/LoginGate.tsx
+export function LoginGate() {
+  const error = new URLSearchParams(window.location.search).get('error');
+
+  return (
+    <main className="card">
+      <h1>zenvora-admin</h1>
+      {error && <p className="status-fault">{error}</p>}
+      <a href="/auth/login">Log in with GitHub</a>
+    </main>
+  );
+}
+```
+
+Run: `cd frontend && bun test src/components/__tests__/loginGate.test.tsx`
+Expected: PASS
+
+- [ ] **Step 10: Update `frontend/src/App.tsx`** to show `LoginGate` at `/login` and the five panels everywhere else
 
 ```tsx
 import { RepoGrid } from './components/RepoGrid';
@@ -2639,8 +2865,13 @@ import { CiHealth } from './components/CiHealth';
 import { SecurityPosture } from './components/SecurityPosture';
 import { DeploymentDrift } from './components/DeploymentDrift';
 import { Backlog } from './components/Backlog';
+import { LoginGate } from './components/LoginGate';
 
 export function App() {
+  if (window.location.pathname === '/login') {
+    return <LoginGate />;
+  }
+
   return (
     <main>
       <h1>zenvora-admin</h1>
@@ -2654,14 +2885,16 @@ export function App() {
 }
 ```
 
-- [ ] **Step 10: Run it, confirm it passes**
+Any panel's `apiGet` still redirects to `/auth/login` on a 401 exactly as before (Task 17) — `LoginGate` only covers the case where the operator lands on `/login` directly, e.g. after Task 5's callback redirects there with a rejection reason.
 
-Run: `cd frontend && bun test src/components/__tests__/panels.test.tsx`
+- [ ] **Step 11: Run it, confirm it passes**
+
+Run: `cd frontend && bun test src/components/__tests__/panels.test.tsx src/components/__tests__/loginGate.test.tsx`
 Expected: PASS
 
-- [ ] **Step 11: Run `bun run dev` and check the golden path in a browser** — per this project's own standard, don't claim a UI change works without seeing it render. Log in via a real GitHub App test installation if credentials are available yet; otherwise confirm each panel's loading/error states render correctly with the dev server up and `/api/*` returning 401.
+- [ ] **Step 12: Run `bun run dev` and check the golden path in a browser** — per this project's own standard, don't claim a UI change works without seeing it render. Log in via a real GitHub App test installation if credentials are available yet; otherwise confirm each panel's loading/error states render correctly with the dev server up and `/api/*` returning 401, and that `/login?error=...` renders the reason text.
 
-- [ ] **Step 12: Commit**
+- [ ] **Step 13: Commit**
 
 ```bash
 git add -A
@@ -2704,6 +2937,7 @@ describe('GET /healthz', () => {
 // tests/server.integration.test.ts
 import { describe, test, expect, beforeAll } from 'bun:test';
 import { randomBytes } from 'node:crypto';
+import { encryptToken } from '../src/auth/crypto';
 
 describe('createApp wiring', () => {
   beforeAll(() => {
@@ -2719,6 +2953,30 @@ describe('createApp wiring', () => {
 
     expect((await app.request('/healthz')).status).toBe(200);
     expect((await app.request('/api/repos')).status).toBe(401);
+  });
+
+  test('a valid session actually reaches the mounted panel routes, not a 404', async () => {
+    // This specifically guards against a route-prefix mismatch (e.g. a panel
+    // registering itself at an absolute "/api/repos" and then getting mounted
+    // under "/api" again, becoming unreachable at "/api/api/repos") — the
+    // 401-only check above would pass even with that bug, since requireAuth
+    // intercepts before Hono ever gets to look for a matching route.
+    const { createApp } = await import('../src/server');
+    const { app, db } = createApp();
+
+    const sessionId = 'test-session-id';
+    db.query(
+      'INSERT INTO sessions (id, user_id, encrypted_token, created_at, expires_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(sessionId, 4242, encryptToken('ghu_fake'), Date.now(), Date.now() + 60_000);
+
+    for (const path of ['/api/repos', '/api/ci', '/api/security', '/api/backlog', '/api/deployment']) {
+      const res = await app.request(path, { headers: { cookie: `zenvora_session=${sessionId}` } });
+      // a real GitHub call will fail without network access (500/502) or hang
+      // on a real fetch attempt that this test doesn't mock — either way, the
+      // one status that would mean "route not found" is 404, and that's the
+      // one this test exists to rule out.
+      expect(res.status).not.toBe(404);
+    }
   });
 });
 ```
@@ -2741,6 +2999,7 @@ import { createCiRoute } from './github/ci';
 import { createSecurityRoute } from './github/security';
 import { createBacklogRoute } from './github/backlog';
 import { createDeploymentRoute } from './deployment/route';
+import { fetchRepoSecurityStatus } from './github/security';
 import { mountStaticFrontend } from './static';
 import { startAlertScheduler, type AlertCheck } from './alerts/scheduler';
 import type { AppVariables } from './types';
@@ -2756,12 +3015,16 @@ const REPOS = [
 ];
 
 const PINNED_CONTAINERS: PinnedContainer[] = [
-  { name: 'homelab-family-api', ghcrPackage: 'family-media-api', pinnedDigest: process.env.FAMILY_API_DIGEST ?? '' },
-  { name: 'homelab-securevault-api', ghcrPackage: 'securevault-api', pinnedDigest: process.env.SECUREVAULT_API_DIGEST ?? '' },
-  { name: 'homelab-dayandyou-staging', ghcrPackage: 'dayandyou', pinnedDigest: process.env.DAYANDYOU_STAGING_DIGEST ?? '' },
-  { name: 'homelab-dayandyou-prod', ghcrPackage: 'dayandyou', pinnedDigest: process.env.DAYANDYOU_PROD_DIGEST ?? '' },
-  { name: 'homelab-memorial-api', ghcrPackage: 'aiqiuqi-memorial-api', pinnedDigest: process.env.MEMORIAL_API_DIGEST ?? '' },
-  { name: 'homelab-memorial-worker', ghcrPackage: 'aiqiuqi-memorial-worker', pinnedDigest: process.env.MEMORIAL_WORKER_DIGEST ?? '' },
+  { name: 'homelab-family-api', ghcrPackage: 'family-media-api', pinnedTag: process.env.FAMILY_API_TAG ?? null },
+  { name: 'homelab-securevault-api', ghcrPackage: 'securevault-api', pinnedTag: process.env.SECUREVAULT_API_TAG ?? null },
+  // dayandyou-staging/-prod have no per-deploy pin variable in docker-compose.yml
+  // at all (static :staging/:release tags) — pinnedTag: null means Task 13's
+  // compareDrift can only ever report ok/upgrade_available for these two, never
+  // a fault, since there is nothing pinned to have drifted from.
+  { name: 'homelab-dayandyou-staging', ghcrPackage: 'dayandyou', pinnedTag: null },
+  { name: 'homelab-dayandyou-prod', ghcrPackage: 'dayandyou', pinnedTag: null },
+  { name: 'homelab-memorial-api', ghcrPackage: 'aiqiuqi-memorial-api', pinnedTag: process.env.MEMORIAL_API_TAG ?? null },
+  { name: 'homelab-memorial-worker', ghcrPackage: 'aiqiuqi-memorial-worker', pinnedTag: process.env.MEMORIAL_WORKER_TAG ?? null },
 ];
 
 export function createApp() {
@@ -2792,7 +3055,7 @@ if (import.meta.main) {
   const { app, db } = createApp();
   const port = Number(process.env.PORT ?? 3100);
 
-  const alertChecks: AlertCheck[] = REPOS.map(({ owner, repo }) => ({
+  const ciChecks: AlertCheck[] = REPOS.map(({ owner, repo }) => ({
     key: `ci:${owner}/${repo}`,
     describe: `CI for ${owner}/${repo}`,
     evaluate: async () => {
@@ -2801,6 +3064,22 @@ if (import.meta.main) {
       return data.workflow_runs[0]?.conclusion === 'failure' ? 'bad' : 'ok';
     },
   }));
+
+  // spec requires the proactive alert to cover security regressions too, not
+  // just CI — reuses the same per-repo Dependabot lookup the security panel
+  // itself uses (Task 10's fetchRepoSecurityStatus), so there's one source of
+  // truth for "what counts as a security alert" rather than two.
+  const securityChecks: AlertCheck[] = REPOS.map(({ owner, repo }) => ({
+    key: `security:${owner}/${repo}`,
+    describe: `Dependabot alerts for ${owner}/${repo}`,
+    evaluate: async () => {
+      const octokit = createOctokit(process.env.ALERT_CHECK_TOKEN ?? '');
+      const status = await fetchRepoSecurityStatus(octokit, owner, repo);
+      return status.openDependabotAlerts > 0 ? 'bad' : 'ok';
+    },
+  }));
+
+  const alertChecks: AlertCheck[] = [...ciChecks, ...securityChecks];
   startAlertScheduler(db, alertChecks);
 
   Bun.serve({ fetch: app.fetch, port });
@@ -2850,7 +3129,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   test:
@@ -2870,6 +3148,12 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # only this job pushes to GHCR — the test job (which also runs on pull_request)
+    # has no business holding write access to packages, so the elevated
+    # permission is scoped here rather than at the workflow level
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
@@ -2889,14 +3173,14 @@ jobs:
 ```dockerfile
 FROM oven/bun:1 AS frontend-build
 WORKDIR /app/frontend
-COPY frontend/package.json frontend/bun.lockb* ./
+COPY frontend/package.json frontend/bun.lock* ./
 RUN bun install --frozen-lockfile
 COPY frontend/ ./
 RUN bun run build
 
 FROM oven/bun:1-slim
 WORKDIR /app
-COPY package.json bun.lockb* ./
+COPY package.json bun.lock* ./
 RUN bun install --frozen-lockfile --production
 COPY src ./src
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
@@ -2904,6 +3188,8 @@ ENV PORT=3100
 EXPOSE 3100
 CMD ["bun", "run", "src/server.ts"]
 ```
+
+Note `bun.lock` (text), not `bun.lockb` — Bun ≥1.2 writes the text-format lockfile by default; the older binary `bun.lockb` name would silently match nothing here and `--frozen-lockfile` would then fail with nothing to freeze against.
 
 - [ ] **Step 3: Verify the image builds locally**
 
@@ -2933,9 +3219,31 @@ This task follows this repo's own "Onboarding a new service" checklist (`README.
 
 **Interfaces:** none — this is the terminal task, wiring the previous 20 tasks' output into the live host.
 
-- [ ] **Step 1: Append the two services to `docker-compose.yml`** — `docker-socket-proxy` binds only to loopback (`127.0.0.1:2375`), not `network_mode: host`, so its API is reachable from `zenvora-admin` (which is host-networked, and can therefore reach any loopback-published port) without being exposed on any non-loopback interface
+- [ ] **Step 1: Create the GitHub App** (manual, in the browser — must happen before the deploy steps below since `zenvora-admin` won't start without real client credentials)
+
+At `https://github.com/settings/apps/new`:
+- Callback URL: `https://admin.valtou.com/auth/callback`.
+- Repository permissions (read-only): Contents, Metadata, Actions, Dependabot alerts, Secret-scanning alerts.
+- Organization permissions (read-only): Administration (needed for 2FA status and the Actions-usage billing endpoint).
+- **Leave "Expire user authorization tokens" OFF.** It's opt-in, not default. Turning it on would require refresh-token handling that nothing in this plan implements — deliberately out of scope for a single-operator tool with an already-short 12h session TTL and one-click re-login. This is a scope decision, not an oversight: don't "fix" it later by enabling expiration without also adding refresh logic.
+- Install the App on **both** the personal account (for `homelab-infra`) and the `ZenvoraAI` organization — two separate installation flows.
+- Copy the generated Client ID and Client Secret; they go into `/opt/secrets/zenvora-admin/.env` in Step 6.
+
+**Smoke-test immediately after this step, before relying on it further**: confirm `GET /user` actually returns a populated `two_factor_authentication` field for this App's user-to-server token. This was flagged during review as uncertain for GitHub Apps specifically (GitHub's docs tie the field to classic OAuth's `user` scope, not confirmed for fine-grained App permissions). If it turns out to always be `null`, Task 5's `!== true` check already fails closed (safe — it just means nobody can log in, not that the wrong person can), but the check would need rework before the tool is usable at all; don't design that fallback now, just verify this first so it's not discovered only after implementing everything else.
+
+- [ ] **Step 2: Append the two services to `docker-compose.yml`**
 
 ```yaml
+  # CONTAINERS=1 permits the whole /containers/* GET surface in this proxy image
+  # (list/inspect, but also logs/top/export/archive across all 7 containers on
+  # the host), not just the /containers/json listing zenvora-admin's own code
+  # calls — there is no finer-grained flag in tecnativa/docker-socket-proxy to
+  # restrict this further, and a bespoke allow-list reverse-proxy in front of a
+  # single internal sidecar is disproportionate complexity here. Accepted as a
+  # residual risk given zenvora-admin's own attack surface is minimal (no file
+  # uploads, no arbitrary command execution paths, one unauthenticated route
+  # pair for the OAuth callback) — written down explicitly so it's a known,
+  # chosen tradeoff rather than an oversight.
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:0.3
     container_name: homelab-docker-socket-proxy
@@ -2965,28 +3273,21 @@ This task follows this repo's own "Onboarding a new service" checklist (`README.
     logging: *default-logging
     depends_on:
       - docker-socket-proxy
+    # Only the tag passthroughs live here, resolved from the same project
+    # .env/shell source that already parameterizes the sibling services' own
+    # image lines (${FAMILY_API_TAG:-latest} etc.) — so zenvora-admin's view of
+    # "what's pinned" and the actual running deploy's pin are always the same
+    # value, nothing to keep in sync by hand. Every secret (App credentials,
+    # encryption key, SMTP, the alert-check PAT) lives ONLY in env_file below —
+    # environment: wins over env_file: in Compose, so listing a secret in both
+    # places risks it being silently blanked if the shell/project .env doesn't
+    # also happen to export it.
     environment:
       - PORT
-      - GITHUB_APP_CLIENT_ID
-      - GITHUB_APP_CLIENT_SECRET
-      - GITHUB_APP_REDIRECT_URI
-      - WHITELISTED_GITHUB_USER_ID
-      - TOKEN_ENCRYPTION_KEY
-      - ALERT_CHECK_TOKEN
-      - DOCKER_PROXY_URL
-      - SMTP_HOST
-      - SMTP_PORT
-      - SMTP_SECURE
-      - SMTP_USER
-      - SMTP_PASS
-      - ALERT_EMAIL_FROM
-      - ALERT_EMAIL_TO
-      - FAMILY_API_DIGEST
-      - SECUREVAULT_API_DIGEST
-      - DAYANDYOU_STAGING_DIGEST
-      - DAYANDYOU_PROD_DIGEST
-      - MEMORIAL_API_DIGEST
-      - MEMORIAL_WORKER_DIGEST
+      - FAMILY_API_TAG
+      - SECUREVAULT_API_TAG
+      - MEMORIAL_API_TAG
+      - MEMORIAL_WORKER_TAG
     env_file:
       - /opt/secrets/zenvora-admin/.env
     volumes:
@@ -2994,7 +3295,55 @@ This task follows this repo's own "Onboarding a new service" checklist (`README.
     mem_limit: 128m
 ```
 
-- [ ] **Step 2: Create `nginx/conf.d/admin.valtou.com.conf`** — same shape as the other vhosts in this directory
+- [ ] **Step 3: Create `nginx/conf.d/admin.valtou.com.conf` — port-80 only, no 443 block yet**
+
+The 443 block must not be committed until the certificate actually exists (Step 5) — nginx refuses to start if a `server{}` block references a missing cert file, which would take down every site sharing this nginx, not just this one. Bootstrap in phases, matching how every other vhost here must have originally been bootstrapped:
+
+```nginx
+server {
+    listen 80;
+    server_name admin.valtou.com;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        try_files $uri =404;
+    }
+
+    location / { return 301 https://$host$request_uri; }
+}
+```
+
+- [ ] **Step 4: Validate and deploy phase 1 (port 80 only)**
+
+```bash
+docker compose config
+bash tests/verify-container-log-limits.sh
+git add docker-compose.yml nginx/conf.d/admin.valtou.com.conf
+git commit -m "feat: onboard zenvora-admin and its docker-socket-proxy sidecar (pre-TLS)"
+```
+
+On the host:
+
+```bash
+cd /opt/homelab-infra
+git pull
+docker compose exec nginx nginx -t   # syntax check against the running container's config, matching scripts/reload-nginx-after-cert-renewal.sh's own approach
+docker compose exec nginx nginx -s reload
+```
+
+- [ ] **Step 5: Provision host-side secrets, then obtain the certificate**
+
+```bash
+# On the host, create the env file with real values (never commit these):
+sudo mkdir -p /opt/secrets/zenvora-admin /opt/data/zenvora-admin
+sudo vi /opt/secrets/zenvora-admin/.env   # fill in every var from .env.example, including the GitHub App credentials from Step 1
+
+sudo certbot certonly --webroot -w /var/lib/homelab-acme -d admin.valtou.com
+```
+
+- [ ] **Step 6: Add the 443 block now that the cert exists, redeploy, verify TLS**
+
+Append to `nginx/conf.d/admin.valtou.com.conf`:
 
 ```nginx
 server {
@@ -3016,81 +3365,63 @@ server {
     include /etc/letsencrypt/options-ssl-nginx.conf;
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 }
-
-server {
-    listen 80;
-    server_name admin.valtou.com;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-        try_files $uri =404;
-    }
-
-    location / { return 301 https://$host$request_uri; }
-}
 ```
 
-- [ ] **Step 3: Update `README.md`'s services table and memory-budget note**
+```bash
+git add nginx/conf.d/admin.valtou.com.conf
+git commit -m "feat: add TLS server block for admin.valtou.com now the cert exists"
+git push
+# on the host:
+git pull
+docker compose exec nginx nginx -t
+docker compose exec nginx nginx -s reload
+```
+
+- [ ] **Step 7: Bring up the app services and verify the docker-socket-proxy networking assumption**
+
+```bash
+# on the host:
+export ZENVORA_ADMIN_TAG=<the-sha-from-Task-20's-CI-run>
+docker compose up -d docker-socket-proxy zenvora-admin
+docker compose logs --since 5m zenvora-admin
+
+# verify the loopback-published port is actually reachable from the host
+# shell — this depends on Docker's userland-proxy, which this repo's own
+# /etc/docker/daemon.json disables (for the log-limit configuration above),
+# so don't assume it works without checking:
+curl http://127.0.0.1:2375/containers/json
+```
+
+If that `curl` fails (connection refused), the userland-proxy path isn't available on this host as suspected — fall back to giving `docker-socket-proxy` `network_mode: host` too (dropping its `ports:` mapping), matching every other service's convention in this file. This accepts the same "firewalled from the public internet" baseline assumption this repo's README already states for every host-network app port — not a new risk category, just consistent with existing practice here.
+
+- [ ] **Step 8: Update `README.md`'s services table, hostname/networking note, and memory-budget sentence**
 
 Add two rows to the services table:
 
 ```markdown
-| `docker-socket-proxy` | `homelab-docker-socket-proxy` | 2375 (loopback only) | none | 16m |
+| `docker-socket-proxy` | `homelab-docker-socket-proxy` | 2375 (loopback only, or host-network — see onboarding notes) | none | 16m |
 | `zenvora-admin` | `homelab-zenvora-admin` | 3100 | `admin.valtou.com` | 128m |
 ```
 
-Update the sum sentence: `2286 MiB` → `2430 MiB` (2286 + 16 + 128), keeping the rest of that paragraph's wording (measured host size, ceiling-not-reservation framing) unchanged — real headroom was independently verified during design (see `docs/superpowers/specs/2026-08-16-zenvora-admin-design.md`, "Open risks").
-
-- [ ] **Step 4: Validate locally**
+Update the sum sentence: `2286 MiB` → `2430 MiB` (2286 + 16 + 128), keeping the rest of that paragraph's wording (measured host size, ceiling-not-reservation framing) unchanged — real headroom was independently verified during design (see `docs/superpowers/specs/2026-08-16-zenvora-admin-design.md`, "Open risks"). Also amend the "Every service uses `network_mode: host`" sentence near the top of the services section — `docker-socket-proxy` is the one exception (unless Step 7's fallback was needed, in which case it isn't an exception after all; update whichever is actually true post-deploy). Add `ZENVORA_ADMIN_TAG` to wherever the other `*_TAG` pinned-image variables are documented.
 
 ```bash
-docker compose config
-bash tests/verify-container-log-limits.sh
-sudo nginx -t -c "$(pwd)/nginx/nginx.conf" 2>&1 || echo "run nginx syntax check on the host instead if not installed locally"
+git add README.md
+git commit -m "docs: document zenvora-admin and docker-socket-proxy in the services table"
 ```
 
-Expected: `docker compose config` prints a valid merged config; `verify-container-log-limits.sh` exits 0 (both new services carry `logging: *default-logging`).
+- [ ] **Step 9: Manual verification of the one thing this plan can't test automatically** — the real docker-socket-proxy against the real socket, and the GHCR package-version tag shape (per Task 13's note that this wasn't independently confirmed) — both called out in the spec's Testing section as needing a manual check, not an automated end-to-end test.
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add docker-compose.yml nginx/conf.d/admin.valtou.com.conf README.md
-git commit -m "feat: onboard zenvora-admin and its docker-socket-proxy sidecar"
-```
-
-- [ ] **Step 6: Provision host-side secrets and deploy** (manual, on the Lightsail host — not automatable from here)
-
-```bash
-# On the host, create the env file with real values (never commit these):
-sudo mkdir -p /opt/secrets/zenvora-admin /opt/data/zenvora-admin
-sudo vi /opt/secrets/zenvora-admin/.env   # fill in every var from .env.example
-
-cd /opt/homelab-infra
-git pull
-export ZENVORA_ADMIN_TAG=<the-sha-from-Task-20's-CI-run>
-docker compose up -d docker-socket-proxy zenvora-admin
-docker compose logs --since 5m zenvora-admin
-```
-
-- [ ] **Step 7: Register the certbot webroot hostname and verify TLS** (per README's "Onboarding a new service" step 5, and its Certbot section)
-
-```bash
-# On the host:
-sudo certbot certonly --webroot -w /var/lib/homelab-acme -d admin.valtou.com
-docker compose restart nginx
-curl -I https://admin.valtou.com/healthz
-```
-
-Expected: `200` from the health check over HTTPS, confirming nginx → `zenvora-admin` routing and the certificate both work.
-
-- [ ] **Step 8: Manual verification of the one thing this plan can't test automatically** — the real docker-socket-proxy against the real socket (per spec's Testing section, this was called out as needing a manual check, not an automated end-to-end test)
-
-Log into `https://admin.valtou.com`, complete the GitHub OAuth flow with 2FA enabled on the account, and confirm the Deployment Drift panel shows all 7 real containers with `ok` signals (assuming the digests in `.env` are current) rather than an error.
+Log into `https://admin.valtou.com`, complete the GitHub OAuth flow with 2FA enabled on the account, and confirm:
+- The Deployment Drift panel shows all 7 real containers, with `fault`/`ok`/`upgrade_available` signals that make sense against what's actually pinned in `.env` (and never a `fault` for the two `dayandyou` containers).
+- The CI Health panel's Actions-quota numbers look plausible against the real enhanced-billing API response (Task 9's note on this being unverified).
+- The Security Posture panel's 2FA line matches the real account state.
 
 ---
 
 ## Self-review notes
 
-- **Spec coverage:** every spec section maps to a task — Problem/Goals → Tasks 8–15 (the four panels + alert); Auth section → Tasks 4–6; Architecture (single process, docker-socket-proxy, SQLite) → Tasks 1–2, 12, 16, 19; Feature panels 1–6 → Tasks 8, 9, 10, 14, 11, 15 respectively; Data flow (SQLite cache, stale-on-error) → Task 7; Error handling → Task 7 (stale fallback) and each panel's frontend error state (Task 18); Testing section's explicit list → covered 1:1 by each task's test file; Open risks (host memory, GitHub App installation scope, SMTP credential) → memory was resolved in the spec itself before this plan was written; App installation scope and SMTP credential remain manual provisioning steps in Task 21 Step 6, which is the correct place for them since they're host-specific secrets, not code.
-- **Placeholder scan:** no TBD/TODO/"add error handling" phrasing anywhere above; every step has real, runnable code.
-- **Type consistency:** `AppVariables` (Task 1) is used consistently by every `Hono<{ Variables: AppVariables }>()` instantiation from Task 6 onward; `createApp()`'s signature change from `Hono` to `{ app, db }` (Task 19) is called out explicitly with the corresponding test update, so it isn't a silent break; `PinnedContainer`/`DriftSignal`/`GhcrVersion` (Task 13) are the same shapes consumed in Task 14 and mirrored (as plain inline types, not a cross-package import) in the frontend's `DeploymentDrift.tsx` (Task 18).
+- **Spec coverage:** every spec section maps to a task — Problem/Goals → Tasks 8–15 (the four panels + alert, now covering both CI and security per the alert-scope fix); Auth section → Tasks 4–6, plus Task 21 Step 1 for the actual GitHub App creation, which the first draft of this plan omitted entirely; Architecture (single process, docker-socket-proxy, SQLite) → Tasks 1–2, 12, 16, 19; Feature panels 1–6 → Tasks 8, 9, 10, 14, 11, 15 respectively; Data flow (SQLite cache, stale-on-error, now actually surfaced to the UI) → Task 7 + Task 18; Error handling → Task 7 (stale fallback), each panel's frontend error state, and the login-page rejection-reason rendering (Task 18); Testing section's explicit list → covered 1:1 by each task's test file, plus the strengthened Task 19 integration test that catches route-mount mismatches the original version's 401-only assertion couldn't; Open risks (host memory — resolved in the spec before this plan existed; GitHub App installation scope and the `two_factor_authentication` field's availability for App tokens — both now explicit verification steps in Task 21 Step 1, not left implicit; SMTP credential — Task 21 Step 5).
+- **Placeholder scan:** no TBD/TODO/"add error handling" phrasing anywhere above; every step has real, runnable code. Two points are explicitly marked as needing empirical verification during implementation rather than treated as certain — the enhanced-billing API's response shape (Task 9) and the GHCR package-version tags array shape (Task 13) — both call out exactly what to check and where, rather than silently assuming either is correct.
+- **Type consistency:** `AppVariables` (Task 1) is used consistently by every `Hono<{ Variables: AppVariables }>()` instantiation from Task 6 onward; `createApp()`'s signature change from `Hono` to `{ app, db }` (Task 19) is called out explicitly with the corresponding test update; `PinnedContainer`/`DriftSignal`/`GhcrVersion` (Task 13, now tag-based: `pinnedTag`/`runningTag`/`latestTag`, not digest-based) are the same shapes consumed in Task 14 and mirrored (as plain inline types, not a cross-package import) in the frontend's `DeploymentDrift.tsx` (Task 18). Every panel route (Tasks 8–11, 14) now registers at a path relative to its `/api` mount and returns `{ data, stale }`, consistently unwrapped by the frontend's `useApiData` hook (Task 18) — this replaces the first draft, where routes were registered at absolute `/api/...` paths that Task 19's `app.route('/api', api)` would have silently double-prefixed, undetected by that draft's test because `requireAuth` intercepted before Hono ever looked for a matching route.
+- **This plan was revised once already**, after an independent 3-agent review (security / plan-coverage / library-API-correctness) found 2 CRITICAL bugs (the route double-prefix, and a digest-vs-tag mismatch that would have made every container in the deployment-drift panel report `fault` permanently) plus a cluster of HIGH/MEDIUM findings, all addressed inline above rather than in a separate errata section.
