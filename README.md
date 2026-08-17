@@ -173,7 +173,7 @@ file on disk breaks nothing. Validate, then recreate.
 | `docker-prune.sh` | Removes images no container references and older than 30 days. Deploys pin exact commit-SHA tags, so every deploy across every project leaves a tagged image behind for ever; unchecked, that fills the disk, which it did on 2026-08-12. The 30-day floor keeps a recent rollback target reachable. |
 | `refresh-memorial-aws-credentials.sh` | Pulls the memorial API and worker AWS credentials from SSM Parameter Store into their env files. |
 | `refresh-memorial-secrets.sh` | Pulls the CloudFront media signing key pair from SSM into the memorial API env file. |
-| `refresh-zenvora-admin-secrets.sh` | Pulls zenvora-admin's 13 secrets (GitHub App credentials, SES SMTP credentials, token-encryption key, whitelisted user ID, two alert-check PATs — one per-owner, since a fine-grained PAT can't span a personal repo and org repos at once) from SSM into its env file. Same pattern as the memorial scripts, for the same reason. |
+| `refresh-zenvora-admin-secrets.sh` | Pulls zenvora-admin's 14 secrets from SSM into its env file: GitHub App credentials, SES SMTP credentials, token-encryption key, whitelisted user ID, plus three separate PATs (two alert-check PATs split by resource owner since a fine-grained PAT can't span a personal repo and org repos at once, and a classic PAT for GHCR package listing since neither GitHub Apps nor fine-grained PATs expose an org-level Packages permission). Same pattern as the memorial scripts, for the same reason. |
 | `reload-nginx-after-cert-renewal.sh` | Certbot deploy hook; reloads the `nginx` container after a renewal. |
 
 The two refresh scripts exist because both memorial containers ran for weeks
