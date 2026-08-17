@@ -3246,19 +3246,23 @@ This task follows this repo's own "Onboarding a new service" checklist (`README.
 
 **Interfaces:** none — this is the terminal task, wiring the previous 20 tasks' output into the live host.
 
-- [ ] **Step 1: Create the GitHub App** (manual, in the browser — must happen before the deploy steps below since `zenvora-admin` won't start without real client credentials)
+- [x] **Step 1: Create the GitHub App** (manual, in the browser — must happen before the deploy steps below since `zenvora-admin` won't start without real client credentials)
+
+**Post-deploy correction — this permission list was incomplete; see "Post-deploy retrospective" below for the full account.** The App ultimately needed, beyond what's listed here: **Secrets** (repository, read-only — for `list-repository-secrets`, missed entirely in the original plan) and **Members** (organization, read-only — the 2FA check below doesn't actually work the way this step assumes; see retrospective). **Packages** (repository, read-only) was also added but turned out not to be sufficient — GHCR's org-level package-version listing needed a separate classic PAT instead, not an App permission at all.
 
 At `https://github.com/settings/apps/new`:
 - Callback URL: `https://admin.valtou.com/auth/callback`.
-- Repository permissions (read-only): Contents, Metadata, Actions, Dependabot alerts, Secret-scanning alerts.
-- Organization permissions (read-only): Administration (needed for 2FA status and the Actions-usage billing endpoint).
+- Repository permissions (read-only): Contents, Metadata, Actions, Dependabot alerts, Secret-scanning alerts, **Secrets** (added post-deploy).
+- Organization permissions (read-only): Administration (needed for the Actions-usage billing endpoint only, not 2FA status as originally assumed — see retrospective), **Members** (added post-deploy, this is what 2FA status actually needs).
 - **Actively uncheck "Expire user authorization tokens."** This setting is **on by default** for a new GitHub App (opt-*out*, not opt-in — confirmed against GitHub's docs during review, correcting an earlier draft of this plan that had the default backwards) — leaving it untouched does the opposite of what's needed here. Unchecking it means tokens don't expire on GitHub's side, which is what lets this plan skip refresh-token handling entirely: deliberately out of scope for a single-operator tool with an already-short 12h session TTL and one-click re-login. This is a scope decision, not an oversight — don't "fix" it later by leaving expiration on without also adding refresh logic.
 - Install the App on **both** the personal account (for `homelab-infra`) and the `ZenvoraAI` organization — two separate installation flows.
 - Copy the generated Client ID and Client Secret; they go into `/opt/secrets/zenvora-admin/.env` in Step 6.
 
 **Smoke-test immediately after this step, before relying on it further**: confirm `GET /user` actually returns a populated `two_factor_authentication` field for this App's user-to-server token. This was flagged during review as uncertain for GitHub Apps specifically (GitHub's docs tie the field to classic OAuth's `user` scope, not confirmed for fine-grained App permissions). If it turns out to always be `null`, Task 5's `!== true` check already fails closed (safe — it just means nobody can log in, not that the wrong person can), but the check would need rework before the tool is usable at all; don't design that fallback now, just verify this first so it's not discovered only after implementing everything else.
 
-- [ ] **Step 2: Append the two services to `docker-compose.yml`**
+**Post-deploy: this uncertainty was real.** `GET /user` via the App's user-to-server token never populates `two_factor_authentication` (confirmed `undefined` in production against an account that genuinely has 2FA on) — it fails closed exactly as this step predicted, blocking all logins. The fix was not a token/permission tweak but a different endpoint entirely: `GET /orgs/{org}/members?filter=2fa_disabled` (needs the **Members** org permission, not Administration) — a user not appearing in that list has 2FA on. Both `src/auth/oauth.ts` (login gate) and `src/github/security.ts` (Security Posture panel's 2FA line) were changed to use this instead. See "Post-deploy retrospective" for the full list of corrections like this one.
+
+- [x] **Step 2: Append the two services to `docker-compose.yml`**
 
 ```yaml
   # CONTAINERS=1 permits the whole /containers/* GET surface in this proxy image
@@ -3316,7 +3320,7 @@ At `https://github.com/settings/apps/new`:
     mem_limit: 128m
 ```
 
-- [ ] **Step 3: Create `nginx/conf.d/admin.valtou.com.conf` — port-80 only, no 443 block yet**
+- [x] **Step 3: Create `nginx/conf.d/admin.valtou.com.conf` — port-80 only, no 443 block yet**
 
 The 443 block must not be committed until the certificate actually exists (Step 5) — nginx refuses to start if a `server{}` block references a missing cert file, which would take down every site sharing this nginx, not just this one. Bootstrap in phases, matching how every other vhost here must have originally been bootstrapped:
 
@@ -3334,7 +3338,7 @@ server {
 }
 ```
 
-- [ ] **Step 4: Validate and deploy phase 1 (port 80 only)**
+- [x] **Step 4: Validate and deploy phase 1 (port 80 only)**
 
 ```bash
 docker compose config
@@ -3352,17 +3356,33 @@ docker compose exec nginx nginx -t   # syntax check against the running containe
 docker compose exec nginx nginx -s reload
 ```
 
-- [ ] **Step 5: Provision host-side secrets, then obtain the certificate**
+- [x] **Step 5: Provision host-side secrets, then obtain the certificate**
+
+**Post-deploy: the `sudo vi` approach below was not what actually happened.** Hand-typing 12+ secrets through a terminal is exactly the failure mode `scripts/refresh-memorial-secrets.sh`'s own comment already warns about ("that's what corrupted [the CloudFront key] before"), and this task ended up with more secrets than originally scoped (see retrospective: two split alert-check PATs, a dedicated GHCR PAT, SES SMTP credentials). What was actually done: a dedicated read-only IAM user (`zenvora-admin-ssm`, scoped to `ssm:GetParameter*` under `/zenvora-admin/prod/*` only) plus `scripts/refresh-zenvora-admin-secrets.sh`, matching the memorial scripts' existing pattern exactly. The host only ever hand-creates the *non-secret* static vars once (`PORT`, `DB_PATH`, `GITHUB_APP_REDIRECT_URI`, `DOCKER_PROXY_URL`); the refresh script fills in every secret from SSM.
 
 ```bash
-# On the host, create the env file with real values (never commit these):
+# On the host, create the env file with only the non-secret static vars:
 sudo mkdir -p /opt/secrets/zenvora-admin /opt/data/zenvora-admin
-sudo vi /opt/secrets/zenvora-admin/.env   # fill in every var from .env.example, including the GitHub App credentials from Step 1
+sudo tee /opt/secrets/zenvora-admin/.env > /dev/null << 'EOF'
+PORT=3100
+DB_PATH=data/zenvora-admin.sqlite
+GITHUB_APP_REDIRECT_URI=https://admin.valtou.com/auth/callback
+DOCKER_PROXY_URL=http://127.0.0.1:2375
+EOF
+sudo chmod 600 /opt/secrets/zenvora-admin/.env
+sudo chown ubuntu:ubuntu /opt/secrets/zenvora-admin/.env   # docker compose runs unprivileged and must be able to read this
+
+# Configure the zenvora-admin-ssm AWS profile as root (the refresh script runs via sudo):
+sudo aws configure set aws_access_key_id <...> --profile zenvora-admin-ssm
+sudo aws configure set aws_secret_access_key <...> --profile zenvora-admin-ssm
+sudo aws configure set region ap-southeast-2 --profile zenvora-admin-ssm
+
+sudo AWS_PROFILE=zenvora-admin-ssm bash scripts/refresh-zenvora-admin-secrets.sh
 
 sudo certbot certonly --webroot -w /var/lib/homelab-acme -d admin.valtou.com
 ```
 
-- [ ] **Step 6: Add the 443 block now that the cert exists, redeploy, verify TLS**
+- [x] **Step 6: Add the 443 block now that the cert exists, redeploy, verify TLS**
 
 Append to `nginx/conf.d/admin.valtou.com.conf`:
 
@@ -3398,7 +3418,9 @@ docker compose exec nginx nginx -t
 docker compose exec nginx nginx -s reload
 ```
 
-- [ ] **Step 7: Bring up the app services and verify the docker-socket-proxy networking assumption**
+- [x] **Step 7: Bring up the app services and verify the docker-socket-proxy networking assumption**
+
+**Post-deploy: the loopback path worked as-is** — `curl http://127.0.0.1:2375/containers/json` succeeded from the host shell and, since `zenvora-admin` itself runs `network_mode: host`, from inside that container too. The `network_mode: host` fallback for `docker-socket-proxy` was never needed. Also, this step's `export ZENVORA_ADMIN_TAG=...` turned out to be a recurring footgun for manual restarts done outside a real CI deploy (the export only lives in that one SSH session; a later bare `docker compose up -d zenvora-admin` in a fresh shell silently falls back to the never-pushed `:latest` tag and fails). Fixed by having the deploy workflow also persist `ZENVORA_ADMIN_TAG` into the gitignored root `.env` (which Compose reads automatically) — see "Post-deploy retrospective."
 
 ```bash
 # on the host:
@@ -3415,7 +3437,7 @@ curl http://127.0.0.1:2375/containers/json
 
 If that `curl` fails (connection refused), the userland-proxy path isn't available on this host as suspected — fall back to giving `docker-socket-proxy` `network_mode: host` too (dropping its `ports:` mapping), matching every other service's convention in this file. This accepts the same "firewalled from the public internet" baseline assumption this repo's README already states for every host-network app port — not a new risk category, just consistent with existing practice here.
 
-- [ ] **Step 8: Update `README.md`'s services table, hostname/networking note, and memory-budget sentence**
+- [x] **Step 8: Update `README.md`'s services table, hostname/networking note, and memory-budget sentence**
 
 Add two rows to the services table:
 
@@ -3431,12 +3453,59 @@ git add README.md
 git commit -m "docs: document zenvora-admin and docker-socket-proxy in the services table"
 ```
 
-- [ ] **Step 9: Manual verification of the one thing this plan can't test automatically** — the real docker-socket-proxy against the real socket, and the GHCR package-version tag shape (per Task 13's note that this wasn't independently confirmed) — both called out in the spec's Testing section as needing a manual check, not an automated end-to-end test.
+- [x] **Step 9: Manual verification of the one thing this plan can't test automatically** — the real docker-socket-proxy against the real socket, and the GHCR package-version tag shape (per Task 13's note that this wasn't independently confirmed) — both called out in the spec's Testing section as needing a manual check, not an automated end-to-end test.
 
 Log into `https://admin.valtou.com`, complete the GitHub OAuth flow with 2FA enabled on the account, and confirm:
 - The Deployment Drift panel shows all 6 tracked containers (the 7th running container, `homelab-nginx`, isn't a deployed product image and was never in `TRACKED_CONTAINERS`), with `ok`/`upgrade_available`/`fault` signals that make sense given how recently each was actually built and deployed.
 - The CI Health panel's Actions-quota numbers look plausible against the real enhanced-billing API response (Task 9's note on this being unverified).
 - The Security Posture panel's 2FA line matches the real account state.
+
+All three confirmed working, but only after the round of fixes documented below — this step is what actually surfaced the 2FA-field and GHCR-permission problems in the first place.
+
+---
+
+## Post-deploy retrospective
+
+Task 21 is done and the app is live at `https://admin.valtou.com`, but real-world execution diverged from this plan in enough load-bearing ways that anyone reading this plan later needs the corrections, not just the original text. Grouped by theme:
+
+### Auth: three permission-model gaps, not one
+
+- **2FA status**: `GET /user`'s `two_factor_authentication` field is never populated for a GitHub App's user-to-server token (confirmed `undefined` against an account that genuinely has 2FA on) — Step 1's smoke-test warning about this was correct to flag it, but the fix isn't a permission tweak, it's a different endpoint: `GET /orgs/{org}/members?filter=2fa_disabled`, gated by the **Members** org permission (not Administration, which the original plan assumed). Both the login gate and the Security Posture panel's 2FA line needed this same fix.
+- **Repo secrets count**: `list-repository-secrets` needs its own **Secrets** repository permission — not covered by "Actions" as the original permission list assumed. Missing this broke both the Security Posture panel and the background alert job's security checks for every repo simultaneously.
+- **GHCR package-version listing**: this is an *organization-level* endpoint (`getAllPackageVersionsForPackageOwnedByOrg`). Neither a GitHub App's permissions (Packages only exists at the *repository* level, not org level) nor a fine-grained PAT (no Packages permission surfaces at all when creating one) can authorize it — confirmed by trying both, repeatedly, in production. Only a **classic PAT** with `read:packages` **and** `repo` scopes works. The Deployment panel is now the one panel that doesn't use the logged-in user's session token — it uses a dedicated `GHCR_READ_TOKEN` instead (wired in `src/server.ts`, no changes needed in `route.ts`/`drift.ts`).
+
+### A fine-grained PAT can't span two resource owners
+
+`ALERT_CHECK_TOKEN` was specified as one PAT covering all 6 repos. It can't: a fine-grained PAT's "Repository access" list is scoped to one Resource Owner (a personal account, or one org) — never both. `homelab-infra` is personal, the other 5 repos are `ZenvoraAI`-owned. Split into `ALERT_CHECK_TOKEN` (ZenvoraAI, 5 repos) and `ALERT_CHECK_TOKEN_PERSONAL` (personal, `homelab-infra` only) — both need Actions + Dependabot alerts + **Secrets** (the same Secrets-permission gap as above bit this PAT too, on the first attempt).
+
+### Secrets management: SSM, not a hand-typed `.env`
+
+Step 5's original `sudo vi` instruction is superseded — see the note inline at that step. The final secret count is 14 (not the dozen originally envisioned), split across `TOKEN_ENCRYPTION_KEY`, `WHITELISTED_GITHUB_USER_ID`, `GITHUB_APP_CLIENT_ID`/`_SECRET`, `ALERT_CHECK_TOKEN`/`_PERSONAL`, `GHCR_READ_TOKEN`, and six `SMTP_*`/`ALERT_EMAIL_*` values for SES. All live in AWS SSM Parameter Store under `/zenvora-admin/prod/*`, readable only by a dedicated `zenvora-admin-ssm` IAM user scoped to that one path, pulled onto the host by `scripts/refresh-zenvora-admin-secrets.sh` (new script, same pattern as the pre-existing memorial-secrets scripts).
+
+### SMTP: SES, using the domain identity already verified
+
+The spec's "Open risks" left the SMTP credential unchosen. It's AWS SES, reusing the `valtou.com` domain identity already verified in this account (production access, not sandboxed) — no new domain verification needed. A dedicated `zenvora-admin-ses` IAM user (send-only, `ses:FromAddress` condition-locked to `*@valtou.com`) generates the SMTP username/password pair via the standard AWS secret-key-to-SMTP-password derivation.
+
+### Deploy automation (not in the original plan at all)
+
+Task 20/21 as written assumed manual `docker compose up -d` for every deploy, the way this task's own steps are written. A `deploy` job was added to `zenvora-admin`'s own `ci.yml` (SSH-based, matching `family-media`'s and this org's other product repos' existing pattern) so `test` → `build` → `deploy` runs automatically on every push to `main`, health-checking `/healthz` before declaring success. Requires its own dedicated deploy key (`DEPLOY_SSH_KEY`/`SSH_KNOWN_HOSTS`/`BACKEND_HOST` repo secrets on `zenvora-admin`, not shared with any other product's key) and passwordless `sudo` for the deploy user on the host (already true for `ubuntu`).
+
+One related fix: the deploy job originally only `export`ed `ZENVORA_ADMIN_TAG` inside its own SSH session, which doesn't survive to a later manual command in a fresh shell — a bare `docker compose up -d zenvora-admin` run to pick up a refreshed secret (no code change) would silently resolve to the never-pushed `:latest` tag and fail. Fixed by also persisting it to the gitignored root `/opt/homelab-infra/.env`, which Compose reads automatically.
+
+### A frontend logout link (not in original scope)
+
+Added post-launch: a plain text "Log out" link in the topbar (no menu needed for a single-operator tool), calling the existing `POST /auth/logout` route. Worth noting for anyone confused by testing it: because the browser typically still has an active `github.com` session and this App is already authorized, clicking logout and landing back on the dashboard immediately can look like "nothing happened" — GitHub silently re-authorizes without a consent prompt. The session *was* actually cleared (verifiable via the 401s that briefly appear mid-cycle); to see a real logged-out state, also sign out of github.com itself or use a private window.
+
+### Independent review after launch found 5 more real bugs
+
+An independent 3-agent code review (run against the deployed `main`, after this task was otherwise complete) found several genuine defects the earlier per-task reviews missed, all fixed and redeployed:
+- `/login?error=...` (and any other client-side route) 404'd instead of loading the SPA — `mountStaticFrontend` had no fallback-to-`index.html` for unmatched paths, so a login rejection never actually showed its reason to the user.
+- The CI-health alert check only matched the literal conclusion `'failure'`, silently treating `timed_out`/`action_required`/`startup_failure`/etc. as healthy and never alerting — exactly the "silent red CI" failure mode this whole tool was built to catch.
+- `requireAuth` threw an uncaught 500 (instead of a clean 401) when a session's token couldn't be decrypted — a rotated `TOKEN_ENCRYPTION_KEY` or corrupted row would leak an internal error to an unauthenticated caller instead of just prompting re-login.
+- The root `package.json`'s own `"test"` script was still unscoped (`bun test`, sweeping in frontend DOM tests without a shim) even after the CI workflow itself had been fixed to scope it — a latent trap for anyone running `bun run test` locally.
+- Backlog search queries had no `repo:` qualifier — defense-in-depth given the token is already installation-scoped, but added anyway to remove the doubt.
+
+Deferred (real but lower-impact, not yet fixed): no `tsc --noEmit` gate in CI (the whole codebase uses a consistent-but-untyped `Hono` pattern pre-`createApp()`, zero runtime impact); Dependabot alerts and repo-secrets count share one `Promise.all` so either failing loses both; the public `homelab-infra` repo is unconditionally labeled `unavailable_on_plan` for branch protection/secret scanning even though that GitHub Free limitation is private-repo-only; docker-socket-proxy failures fall back to stale cache like any other panel instead of the explicit error the spec calls for on that panel specifically.
 
 ---
 
