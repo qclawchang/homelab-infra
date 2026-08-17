@@ -19,13 +19,17 @@ release workflows remain in their own repositories.
 | `dayandyou-staging` | `homelab-dayandyou-staging` | 3002 | `staging.dayandyou.com` | 350m |
 | `memorial-api` | `homelab-memorial-api` | 3001 | `api.aiqiuqi.com` | 192m |
 | `memorial-worker` | `homelab-memorial-worker` | — | none (no listener) | 384m |
+| `docker-socket-proxy` | `homelab-docker-socket-proxy` | 2375 (loopback only) | none | 16m |
+| `zenvora-admin` | `homelab-zenvora-admin` | 3100 | `admin.valtou.com` | 128m |
 
-Every service uses `network_mode: host`; the application ports must remain
-firewalled from the public internet. Docker nginx is the only public reverse
-proxy. `memorial-worker` is the one service with no port and no vhost — it
-processes media out of band.
+Every service uses `network_mode: host` except `docker-socket-proxy`, which
+publishes only to `127.0.0.1:2375` (confirmed reachable via the host's
+userland-proxy, so no host-network fallback was needed) — the application
+ports must remain firewalled from the public internet. Docker nginx is the
+only public reverse proxy. `memorial-worker` is the one service with no port
+and no vhost — it processes media out of band.
 
-Those limits sum to 2286 MiB on a host measured at 1.9 GiB, so the box is
+Those limits sum to 2430 MiB on a host measured at 1.9 GiB, so the box is
 deliberately oversubscribed by roughly 18%. A `mem_limit` is a ceiling, not a
 reservation, and no service sits near its own ceiling — but the arithmetic means
 several services peaking together is an OOM, not a slowdown. Check
@@ -56,6 +60,7 @@ rather than racing `:latest`:
 | `SECUREVAULT_API_TAG` | `securevault-api` | `latest` |
 | `MEMORIAL_API_TAG` | `memorial-api` | `latest` |
 | `MEMORIAL_WORKER_TAG` | `memorial-worker` | `latest` |
+| `ZENVORA_ADMIN_TAG` | `zenvora-admin` | `latest` |
 
 Day and You pins by channel instead — `dayandyou:release` and
 `dayandyou:staging` — so it has no tag variable.
