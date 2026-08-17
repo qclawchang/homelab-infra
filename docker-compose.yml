@@ -170,3 +170,56 @@ services:
     env_file:
       - /opt/secrets/aiqiuqi-memorial/worker.env
     mem_limit: 384m
+  # CONTAINERS=1 permits the whole /containers/* GET surface in this proxy image
+  # (list/inspect, but also logs/top/export/archive across all 7 containers on
+  # the host), not just the /containers/json listing zenvora-admin's own code
+  # calls — there is no finer-grained flag in tecnativa/docker-socket-proxy to
+  # restrict this further, and a bespoke allow-list reverse-proxy in front of a
+  # single internal sidecar is disproportionate complexity here. Accepted as a
+  # residual risk given zenvora-admin's own attack surface is minimal (no file
+  # uploads, no arbitrary command execution paths, one unauthenticated route
+  # pair for the OAuth callback) — written down explicitly so it's a known,
+  # chosen tradeoff rather than an oversight.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3
+    container_name: homelab-docker-socket-proxy
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      - CONTAINERS=1
+      - POST=0
+      - EXEC=0
+      - BUILD=0
+      - COMMIT=0
+      - ATTACH=0
+      - IMAGES=0
+      - INFO=0
+      - NETWORKS=0
+      - VOLUMES=0
+    ports:
+      - "127.0.0.1:2375:2375"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    mem_limit: 16m
+  zenvora-admin:
+    image: ghcr.io/${GHCR_OWNER:-zenvoraai}/zenvora-admin:${ZENVORA_ADMIN_TAG:-latest}
+    container_name: homelab-zenvora-admin
+    network_mode: host
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - docker-socket-proxy
+    # No environment: block at all — everything, including the non-secret
+    # PORT, lives in env_file, matching the memorial-api/memorial-worker
+    # pattern above. A bare `environment: - PORT` passthrough would resolve
+    # from the shell/project .env at `docker compose up` time (not from this
+    # service's own env_file) and, critically, Compose's environment: always
+    # wins over env_file: for the same key — if PORT weren't also exported at
+    # the shell level, that bare passthrough would silently blank it to an
+    # empty string rather than falling back to whatever env_file set, which
+    # would make Bun try to listen on port 0. One file, one source of truth.
+    env_file:
+      - /opt/secrets/zenvora-admin/.env
+    volumes:
+      - /opt/data/zenvora-admin:/app/data
+    mem_limit: 128m
